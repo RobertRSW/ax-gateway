@@ -25,9 +25,10 @@ classifiers = [
     "Topic :: Communications",
 ]
 dependencies = [
-    "typer>=0.9",
+    "typer>=0.25.1",
     "httpx>=0.25",
     "rich>=13.0",
+    "pyyaml>=6.0.3",
 ]
 
 [project.urls]
@@ -41,11 +42,11 @@ ax = "ax_cli.main:main"
 
 [project.optional-dependencies]
 dev = [
-    "build>=1.2",
+    "build>=1.5.0",
     "pre-commit>=4.6.0",
-    "pytest>=8.0",
+    "pytest>=9.0.3",
     "pytest-cov>=7.1.0",
-    "ruff>=0.4",
+    "ruff>=0.15.12",
     "twine>=6.2.0",
 ]
 
@@ -67,4 +68,8 @@ ignore = ["E501"]  # Line length handled by formatter, not linter
 include = ["ax_cli*"]
 
 [tool.setuptools.package-data]
-ax_cli = ["static/*.html"]
+ax_cli = [
+    "static/*.html",
+    "plugins/platforms/ax/*.yaml",
+    "plugins/platforms/ax/*.md",
+]

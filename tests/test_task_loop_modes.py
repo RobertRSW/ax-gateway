@@ -387,15 +387,16 @@ def test_pause_resume_cycle(monkeypatch, tmp_path):
     result = runner.invoke(app, ["reminders", "pause", "rem-pause", "--file", str(policy_file), "--json"])
     assert result.exit_code == 0, result.output
     policy = _load(policy_file)["policies"][0]
-    assert policy["enabled"] is False
-    assert policy["disabled_reason"] == "paused"
+    assert policy["enabled"] is True
+    assert policy["paused"] is True
+    assert policy["paused_reason"] == "Paused by operator."
 
     # Resume
     result = runner.invoke(app, ["reminders", "resume", "rem-pause", "--file", str(policy_file), "--json"])
     assert result.exit_code == 0, result.output
     policy = _load(policy_file)["policies"][0]
     assert policy["enabled"] is True
-    assert "disabled_reason" not in policy
+    assert policy["paused"] is False
 
 
 def test_update_priority_reorders_queue(monkeypatch, tmp_path):

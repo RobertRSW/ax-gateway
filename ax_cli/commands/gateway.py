@@ -5,6 +5,7 @@ from __future__ import annotations
 import getpass
 import json
 import os
+import secrets
 import shlex
 import shutil
 import signal
@@ -42,10 +43,13 @@ from ..commands.bootstrap import (
 )
 from ..config import resolve_space_id, resolve_user_base_url, resolve_user_token
 from ..gateway import (
+    AX_PLUGIN_NAME,
     GatewayDaemon,
     _format_daemon_log_line,
+    _hermes_plugin_home,
     _is_passive_runtime,
     _is_system_agent,
+    _plugin_source_dir,
     active_gateway_pid,
     active_gateway_pids,
     active_gateway_ui_pid,
@@ -80,6 +84,7 @@ from ..gateway import (
     load_recent_gateway_activity,
     load_space_cache,
     looks_like_space_uuid,
+    lookup_space_in_cache,
     ollama_setup_status,
     record_gateway_activity,
     remove_agent_entry,
@@ -227,14 +232,25 @@ class UpstreamRateLimitedError(RuntimeError):
         super().__init__(f"Upstream rate-limited after {retries_attempted} retries")
 
 
-def _with_upstream_429_retry(call, *, max_retries: int, base_wait: float = 1.0):
-    """Run ``call`` and retry on httpx 429 with exponential backoff.
+def _with_upstream_429_retry(
+    call,
+    *,
+    max_retries: int,
+    base_wait: float = 1.0,
+    max_wait: float = 120.0,
+):
+    """Run ``call`` and retry on httpx 429, honoring ``Retry-After`` when present.
 
-    Waits ``base_wait * 2**attempt`` between attempts. Other httpx
-    exceptions (4xx/5xx that aren't 429, network errors) propagate
+    Per-attempt wait = ``max(base_wait * 2**attempt, retry_after_seconds)``,
+    capped at ``max_wait``. paxai.app sends ``Retry-After: <seconds>`` on its
+    per-user rate-limit responses; ignoring it and falling back to a 1s/2s
+    exponential backoff exhausts the retry budget far below the server's
+    cooldown and surfaces as a spurious ``UpstreamRateLimitedError``.
+
+    Other httpx exceptions (4xx/5xx that aren't 429, network errors) propagate
     immediately. After the configured retry budget is exhausted on a
     persistent 429, raises ``UpstreamRateLimitedError`` carrying the
-    final exception and any Retry-After hint.
+    final exception.
     """
     attempts = 0
     while True:
@@ -245,7 +261,13 @@ def _with_upstream_429_retry(call, *, max_retries: int, base_wait: float = 1.0):
                 raise
             if attempts >= max_retries:
                 raise UpstreamRateLimitedError(exc, attempts) from exc
-            wait = base_wait * (2**attempts)
+            retry_after_raw = exc.response.headers.get("retry-after")
+            try:
+                hint = float(retry_after_raw) if retry_after_raw is not None else 0.0
+            except (TypeError, ValueError):
+                hint = 0.0
+            exp = base_wait * (2**attempts)
+            wait = min(max(exp, hint), max_wait)
             time.sleep(wait)
             attempts += 1
 
@@ -451,6 +473,22 @@ def _connect_local_pass_through_agent(
         )
         raise ValueError("fingerprint_mismatch")
 
+    # Look up the requested agent by name FIRST. If it already exists in the
+    # registry, the operator has previously approved this identity at this
+    # workdir (or anywhere) and is just (re-)connecting. Multi-tenant case:
+    # cli_god and pulse-cc can both legitimately operate from the same
+    # physical workdir, each with its own registry row. Running the
+    # collision check before the by-name lookup would have rejected
+    # cli_god's reconnect just because pulse-cc's row also fingerprints
+    # this directory.
+    if entry is None:
+        entry = find_agent_entry(registry, normalized_name)
+
+    # Collision check only runs when the requested name is genuinely new
+    # (no existing registry row). This still protects against accidental
+    # duplicate registrations — registering a fresh agent at a workdir
+    # already owned by a different agent surfaces the explicit error so
+    # the operator can decide how to proceed.
     if entry is None:
         collision = _find_local_origin_collision(
             registry,
@@ -463,11 +501,10 @@ def _connect_local_pass_through_agent(
                 "Gateway identity mismatch: "
                 f"this local origin is already registered as @{existing_name}. "
                 "Use that repo-local .ax/config.toml identity, reconnect by registry ref, "
-                "or remove/rename the existing registry row before requesting a new agent name."
+                "or remove/rename the existing registry row before requesting a new agent name. "
+                "If multiple agents legitimately share this workdir, register the new agent "
+                "from a different working directory first, then it can re-connect from here."
             )
-
-    if entry is None:
-        entry = find_agent_entry(registry, normalized_name)
     if entry is None:
         if not auto_create:
             raise LookupError(f"Managed agent not found: {normalized_name}")
@@ -543,6 +580,101 @@ def _connect_local_pass_through_agent(
     return payload
 
 
+def _gateway_session_challenge_enabled() -> bool:
+    """Phase-1 opt-in flag for the pass-through session challenge.
+
+    Closes aX task ``68cb4d29`` (Phase-1: ``/local/send`` only). Truthy values
+    on ``AX_GATEWAY_SESSION_CHALLENGE`` enable the challenge cycle. Anything
+    else — including an unset env var — preserves the current easy path so
+    operators who haven't opted in see no behavior change.
+
+    The challenge is intentionally testing-flavored, not production hardening:
+    use it as a memory/session-retention probe, and as a guard against
+    accidental identity sharing when several ephemeral sessions run from the
+    same workdir.
+    """
+    raw = os.environ.get("AX_GATEWAY_SESSION_CHALLENGE", "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _generate_session_challenge_code() -> str:
+    """Short URL-safe code suitable for an operator to read and echo back.
+
+    Uppercased so it's distinct from any base64-shaped token in the same
+    output and easy to type. ~6–8 chars depending on the random bytes' shape.
+    """
+    return secrets.token_urlsafe(4).upper()
+
+
+def _find_local_session_record(registry: dict, session_id: str) -> dict | None:
+    """Look up the registry record for a verified local session id."""
+    target = (session_id or "").strip()
+    if not target:
+        return None
+    for item in registry.get("local_sessions") or []:
+        if str(item.get("session_id") or "") == target:
+            return item
+    return None
+
+
+def _ensure_session_challenge(
+    registry: dict,
+    session_id: str,
+    *,
+    provided_proof: str | None,
+) -> str:
+    """Verify or issue a session-continuity challenge.
+
+    Returns the next challenge code (the proof the caller should echo back
+    on the *next* send) when the provided proof matches the stored one.
+
+    Raises ``ValueError`` with a structured error message in two cases:
+    no stored challenge yet (a new one is issued for the next send), or
+    proof mismatch / missing proof against an existing stored challenge.
+    Both error messages start with a recognizable prefix so callers can
+    surface them without further parsing.
+    """
+    record = _find_local_session_record(registry, session_id)
+    if record is None:
+        # The token verified upstream, but the registry record is gone —
+        # treat as a hard rejection rather than auto-issuing a challenge for
+        # an unknown session.
+        raise ValueError("session_challenge_unknown_session: no record for this session.")
+
+    stored = str(record.get("challenge_code") or "").strip()
+    proof = str(provided_proof or "").strip()
+
+    if not stored:
+        # First send under the flag for this session: issue a challenge and
+        # require the caller to echo it on the next send.
+        new_code = _generate_session_challenge_code()
+        record["challenge_code"] = new_code
+        record["challenge_issued_at"] = datetime.now(timezone.utc).isoformat()
+        save_gateway_registry(registry)
+        raise ValueError(
+            f"session_challenge_required: {new_code}. Re-run with --session-proof <code> to confirm session continuity."
+        )
+
+    if not proof:
+        raise ValueError(
+            f"session_challenge_required: {stored}. Re-run with --session-proof <code> to confirm session continuity."
+        )
+
+    if proof != stored:
+        raise ValueError(
+            f"invalid_session_proof: expected {stored}. "
+            "Run once without --session-proof to re-issue the challenge if you've lost it."
+        )
+
+    # Valid proof: rotate the code so the caller has a fresh proof for the
+    # next send. Each successful send consumes one code.
+    new_code = _generate_session_challenge_code()
+    record["challenge_code"] = new_code
+    record["challenge_issued_at"] = datetime.now(timezone.utc).isoformat()
+    save_gateway_registry(registry)
+    return new_code
+
+
 def _send_local_session_message(*, session_token: str, body: dict) -> dict:
     registry = load_gateway_registry()
     session = verify_local_session_token(registry, session_token)
@@ -566,6 +698,19 @@ def _send_local_session_message(*, session_token: str, body: dict) -> dict:
         raise ValueError("space_id is required.")
     if not content:
         raise ValueError("content is required.")
+
+    # aX task 68cb4d29: Phase-1 opt-in session-continuity challenge. Only
+    # gates the /local/send path for now; everything else (inbox poll,
+    # generic proxy methods) keeps the easy path. When the env flag is
+    # not set, this is a no-op — preserving the current behavior.
+    next_session_proof: str | None = None
+    if _gateway_session_challenge_enabled():
+        next_session_proof = _ensure_session_challenge(
+            registry,
+            str(session.get("session_id") or ""),
+            provided_proof=str(body.get("session_proof") or "").strip() or None,
+        )
+
     client = _load_managed_agent_client(entry)
     metadata = {
         **(body.get("metadata") if isinstance(body.get("metadata"), dict) else {}),
@@ -604,7 +749,10 @@ def _send_local_session_message(*, session_token: str, body: dict) -> dict:
         message_id=(payload.get("message") or {}).get("id"),
         attachment_count=len(attachments_payload or []),
     )
-    return {"agent": entry.get("name"), "message": payload, "session": session}
+    response = {"agent": entry.get("name"), "message": payload, "session": session}
+    if next_session_proof is not None:
+        response["next_session_proof"] = next_session_proof
+    return response
 
 
 def _create_local_session_task(*, session_token: str, body: dict) -> dict:
@@ -652,26 +800,27 @@ def _create_local_session_task(*, session_token: str, body: dict) -> dict:
 
 
 _LOCAL_PROXY_METHODS: dict[str, dict] = {
-    "whoami": {},
-    "list_spaces": {},
-    "list_agents": {"kwargs": ["space_id", "limit"]},
-    "list_agents_availability": {"kwargs": ["space_id", "filter_"]},
-    "list_context": {"kwargs": ["prefix", "space_id"]},
-    "get_context": {"args": ["key"], "kwargs": ["space_id"]},
+    "whoami": {"tier": "use"},
+    "list_spaces": {"tier": "use"},
+    "list_agents": {"tier": "use", "kwargs": ["space_id", "limit"]},
+    "list_agents_availability": {"tier": "use", "kwargs": ["space_id", "filter_"]},
+    "list_context": {"tier": "use", "kwargs": ["prefix", "space_id"]},
+    "get_context": {"tier": "use", "args": ["key"], "kwargs": ["space_id"]},
     "list_messages": {
+        "tier": "use",
         "kwargs": ["limit", "space_id", "channel", "agent_id", "unread_only", "mark_read"],
     },
-    "get_message": {"args": ["message_id"]},
-    "search_messages": {"args": ["query"], "kwargs": ["limit", "agent_id"]},
-    "list_tasks": {"kwargs": ["limit", "space_id"]},
-    "get_task": {"args": ["task_id"]},
-    "update_task": {"args": ["task_id"], "kwargs": ["status", "priority"]},
+    "get_message": {"tier": "use", "args": ["message_id"]},
+    "search_messages": {"tier": "use", "args": ["query"], "kwargs": ["limit", "agent_id"]},
+    "list_tasks": {"tier": "use", "kwargs": ["limit", "space_id"]},
+    "get_task": {"tier": "use", "args": ["task_id"]},
+    "update_task": {"tier": "admin", "args": ["task_id"], "kwargs": ["status", "priority", "assignee_id"]},
     # File upload proxy: agents on the Gateway-native path can attach files
     # to messages without holding the user PAT. Daemon reads the path on
     # behalf of the agent and uploads via the agent's managed AxClient, so
     # the upload is correctly attributed to the agent identity. Local-only
     # by construction (paths are relative to the operator's filesystem).
-    "upload_file": {"args": ["file_path"], "kwargs": ["space_id"]},
+    "upload_file": {"tier": "admin", "args": ["file_path"], "kwargs": ["space_id"]},
 }
 
 
@@ -807,12 +956,48 @@ def _local_session_inbox(
     }
 
 
+def _resolve_space_via_cache(value: str | None) -> str | None:
+    """Cache-only space resolver for the pass-through (`local_*`) commands.
+
+    Pass-through agents must not need the user PAT, so we cannot fall back
+    to a fresh `client.list_spaces()` here — that would defeat the trust
+    boundary. The on-disk space cache (populated by any prior user-side
+    Gateway command) is the authoritative source on the agent side.
+
+    Returns the canonical UUID for a slug or name when found, the original
+    UUID-like input verbatim, or ``None`` if neither (caller decides whether
+    to error or pass through).
+
+    This intentionally diverges from `config.resolve_space_id()`, which
+    requires an authoring client and falls back to upstream `list_spaces`.
+    """
+    if not value:
+        return None
+    raw = str(value).strip()
+    if not raw:
+        return None
+    # UUID-like passes through unchanged.
+    try:
+        from uuid import UUID
+
+        UUID(raw)
+        return raw
+    except ValueError:
+        pass
+    cached = lookup_space_in_cache(raw)
+    if cached:
+        sid = str(cached.get("id") or cached.get("space_id") or "").strip()
+        if sid:
+            return sid
+    return None
+
+
 def _normalize_runtime_type(runtime_type: str) -> str:
     try:
         return str(runtime_type_definition(runtime_type)["id"])
     except KeyError as exc:
         raise ValueError(
-            "Unsupported runtime type. Use echo, exec, hermes_sentinel, sentinel_cli, claude_code_channel, or inbox."
+            "Unsupported runtime type. Use echo, exec, hermes_plugin, hermes_sentinel, sentinel_cli, claude_code_channel, or inbox."
         ) from exc
 
 
@@ -1050,6 +1235,8 @@ def _register_managed_agent(
     model: str | None = None,
     system_prompt: str | None = None,
     timeout_seconds: int | None = None,
+    allow_all_users: bool = False,
+    allowed_users: str | None = None,
     start: bool = True,
 ) -> dict:
     name = name.strip()
@@ -1169,6 +1356,10 @@ def _register_managed_agent(
     }
     if normalized_system_prompt:
         entry_payload["system_prompt"] = normalized_system_prompt
+    if allow_all_users:
+        entry_payload["allow_all_users"] = True
+    if allowed_users and str(allowed_users).strip():
+        entry_payload["allowed_users"] = str(allowed_users).strip()
     if requires_approval:
         entry_payload["install_id"] = str(uuid.uuid4())
     entry = upsert_agent_entry(registry, entry_payload)
@@ -1449,6 +1640,8 @@ def _update_managed_agent(
     model: str | None = None,
     system_prompt: str | object = _UNSET,
     timeout_seconds: int | object = _UNSET,
+    allow_all_users: bool | object = _UNSET,
+    allowed_users: str | object = _UNSET,
     desired_state: str | None = None,
 ) -> dict:
     name = name.strip()
@@ -1542,6 +1735,17 @@ def _update_managed_agent(
     entry["runtime_type"] = runtime_effective
     entry["exec_command"] = exec_effective
     entry["workdir"] = workdir_effective
+    if allow_all_users is not _UNSET:
+        if allow_all_users:
+            entry["allow_all_users"] = True
+        else:
+            entry.pop("allow_all_users", None)
+    if allowed_users is not _UNSET:
+        allowed_clean = str(allowed_users or "").strip()
+        if allowed_clean:
+            entry["allowed_users"] = allowed_clean
+        else:
+            entry.pop("allowed_users", None)
     if template_effective_id == "ollama":
         entry["ollama_model"] = ollama_model_effective
     else:
@@ -1631,6 +1835,115 @@ def _mark_attached_agent_session(name: str, *, note: str | None = None) -> dict:
         "manual_attach_confirmed",
         entry=entry,
         activity_message=str(note or "Operator marked attached session as active."),
+    )
+    return annotate_runtime_health(entry, registry=registry)
+
+
+_EXTERNAL_RUNTIME_RUNNING_STATUSES = {
+    "accepted",
+    "active",
+    "connected",
+    "heartbeat",
+    "processing",
+    "running",
+    "started",
+    "thinking",
+    "tool",
+    "working",
+}
+_EXTERNAL_RUNTIME_COMPLETE_STATUSES = {"completed", "done", "idle", "ready"}
+_EXTERNAL_RUNTIME_STOPPED_STATUSES = {"disconnected", "offline", "stopped"}
+
+
+def _announce_external_agent_runtime(name: str, body: dict) -> dict:
+    registry = load_gateway_registry()
+    entry = find_agent_entry(registry, name)
+    if not entry:
+        raise LookupError(f"Managed agent not found: {name}")
+
+    now = datetime.now(timezone.utc).isoformat()
+    status = str(body.get("status") or "connected").strip().lower()
+    runtime_kind = str(body.get("runtime_kind") or "external").strip() or "external"
+    message_id = str(body.get("message_id") or "").strip()
+    activity = str(body.get("activity") or body.get("status_text") or "").strip()
+    current_tool = str(body.get("current_tool") or body.get("tool") or "").strip()
+    pid = str(body.get("pid") or "").strip()
+    workdir = str(body.get("workdir") or "").strip()
+    runtime_instance_id = str(body.get("runtime_instance_id") or "").strip()
+    if not runtime_instance_id:
+        runtime_instance_id = f"external:{runtime_kind}:{name}:{pid or 'unknown'}"
+
+    desired_stopped = str(entry.get("desired_state") or "stopped").strip().lower() == "stopped"
+    if status in _EXTERNAL_RUNTIME_STOPPED_STATUSES:
+        entry["desired_state"] = "stopped"
+    elif not desired_stopped:
+        entry["desired_state"] = "running"
+    entry["runtime_instance_id"] = runtime_instance_id
+    entry["external_runtime_instance_id"] = runtime_instance_id
+    entry["external_runtime_kind"] = runtime_kind
+    entry["external_runtime_managed"] = True
+    entry["external_runtime_seen_at"] = now
+    entry["external_runtime_status"] = status
+    entry["external_runtime_state"] = "offline" if status in _EXTERNAL_RUNTIME_STOPPED_STATUSES else "connected"
+    if pid:
+        entry["external_runtime_pid"] = pid
+    if workdir:
+        entry["external_runtime_workdir"] = workdir
+
+    if status in _EXTERNAL_RUNTIME_STOPPED_STATUSES:
+        entry["effective_state"] = "stopped"
+        entry["last_disconnected_at"] = now
+        entry["current_status"] = None
+        entry["current_tool"] = None
+        entry["current_tool_call_id"] = None
+        if activity:
+            entry["current_activity"] = activity[:240]
+    elif desired_stopped:
+        entry["effective_state"] = "stopped"
+        entry["runtime_instance_id"] = None
+        entry["last_seen_at"] = now
+        entry["current_status"] = None
+        entry["current_tool"] = None
+        entry["current_tool_call_id"] = None
+        entry["local_attach_state"] = "external_stopped"
+        entry["local_attach_detail"] = (
+            "Operator requested stop; external runtime heartbeats will not mark this agent live."
+        )
+        if activity:
+            entry["current_activity"] = activity[:240]
+    else:
+        entry["effective_state"] = "running"
+        entry["last_seen_at"] = now
+        entry["last_connected_at"] = entry.get("last_connected_at") or now
+        entry["backlog_depth"] = 0
+        if status in _EXTERNAL_RUNTIME_RUNNING_STATUSES:
+            entry["current_status"] = "processing" if status in {"tool", "working"} else status
+            if activity:
+                entry["current_activity"] = activity[:240]
+            if current_tool:
+                entry["current_tool"] = current_tool[:120]
+        elif status in _EXTERNAL_RUNTIME_COMPLETE_STATUSES:
+            entry["current_status"] = None
+            entry["current_tool"] = None
+            entry["current_tool_call_id"] = None
+            if activity:
+                entry["current_activity"] = activity[:240]
+        if message_id:
+            if status in _EXTERNAL_RUNTIME_COMPLETE_STATUSES:
+                entry["last_work_completed_at"] = now
+                entry["last_reply_message_id"] = message_id
+            else:
+                entry["last_work_received_at"] = now
+                entry["last_received_message_id"] = message_id
+
+    save_gateway_registry(registry)
+    record_gateway_activity(
+        "external_runtime_announced",
+        entry=entry,
+        runtime_kind=runtime_kind,
+        runtime_status=status,
+        message_id=message_id or None,
+        activity_message=activity or None,
     )
     return annotate_runtime_health(entry, registry=registry)
 
@@ -2079,6 +2392,42 @@ def _sync_passive_queue_after_manual_send(
         )
 
 
+def _poll_managed_agent_inbox_after_send(
+    *,
+    name: str,
+    space_id: str | None,
+    limit: int,
+    wait_seconds: int,
+    channel: str = "main",
+    poll_interval: float = 1.0,
+) -> dict:
+    """Bundle "what arrived while you were drafting" for a managed-agent send.
+
+    Mirrors ``_poll_local_inbox_over_http``'s wait loop, but uses the
+    in-process ``_inbox_for_managed_agent`` (Live Listener / managed-agent
+    path) instead of the local-session HTTP proxy. Closes aX task
+    ``663d9e6f``: every send-as-agent path should return inbound messages
+    that arrived during the send so two agents don't talk past each other.
+
+    ``mark_read=True`` so the same messages don't re-appear on the next
+    poll. The wait loop exits as soon as we have messages or the deadline
+    elapses.
+    """
+    deadline = time.monotonic() + max(0, int(wait_seconds))
+    while True:
+        result = _inbox_for_managed_agent(
+            name=name,
+            limit=max(1, int(limit)),
+            channel=channel,
+            space_id=space_id,
+            unread_only=True,
+            mark_read=True,
+        )
+        if result.get("messages") or wait_seconds <= 0 or time.monotonic() >= deadline:
+            return result
+        time.sleep(poll_interval)
+
+
 def _send_from_managed_agent(
     *,
     name: str,
@@ -2088,6 +2437,10 @@ def _send_from_managed_agent(
     space_id: str | None = None,
     sent_via: str = "gateway_cli",
     metadata_extra: dict[str, object] | None = None,
+    include_inbox: bool = True,
+    inbox_wait: int = 2,
+    inbox_limit: int = 10,
+    inbox_channel: str = "main",
 ) -> dict:
     if not content.strip():
         raise ValueError("Message content is required.")
@@ -2144,7 +2497,22 @@ def _send_from_managed_agent(
             reply_message_id=str(payload.get("id") or "") or None,
             reply_preview=message_content[:120] or None,
         )
-    return {"agent": entry.get("name"), "message": payload, "content": message_content}
+    response: dict = {"agent": entry.get("name"), "message": payload, "content": message_content}
+    if include_inbox:
+        try:
+            response["inbox"] = _poll_managed_agent_inbox_after_send(
+                name=str(entry.get("name") or name),
+                space_id=selected_space_id,
+                limit=inbox_limit,
+                wait_seconds=inbox_wait,
+                channel=inbox_channel,
+            )
+        except Exception as exc:
+            # Inbox bundling is a best-effort enhancement on top of the send.
+            # If it fails (transient API error, etc.) we still return the send
+            # result the operator/agent actually depends on.
+            response["inbox_error"] = str(exc)
+    return response
 
 
 def _inbox_for_managed_agent(
@@ -3215,6 +3583,92 @@ def _run_gateway_doctor(name: str, *, send_test: bool = False) -> dict:
                 add_check("ollama_model", "warning", "No Ollama model is selected yet.")
         add_check("launch_path", "passed", "Gateway can launch the Ollama bridge on send.")
 
+    runtime_type = str(entry.get("runtime_type") or "").strip().lower()
+    if runtime_type == "hermes_plugin":
+        # Two distinct failure modes silently break the Hermes plugin path,
+        # and each presents identically (agent shows running, no replies).
+        # Surface them as separate checks so the operator can tell which
+        # broke without source-diving.
+        try:
+            hermes_home = _hermes_plugin_home(entry)
+            plugin_link = hermes_home / "plugins" / "ax"
+            plugin_source = _plugin_source_dir()
+            if plugin_link.is_symlink() and plugin_link.resolve() == plugin_source.resolve():
+                add_check(
+                    "ax_platform_symlink",
+                    "passed",
+                    f"{plugin_link} → {plugin_source} (Hermes can load the aX adapter).",
+                )
+            elif plugin_link.exists():
+                add_check(
+                    "ax_platform_symlink",
+                    "warning",
+                    f"{plugin_link} exists but does not resolve to {plugin_source}. "
+                    f"Delete it; Gateway will re-link on the next start.",
+                )
+            else:
+                add_check(
+                    "ax_platform_symlink",
+                    "failed",
+                    f"{plugin_link} is missing. Run `ax gateway agents start {entry.get('name') or '<name>'}` "
+                    f"to trigger the scaffold.",
+                )
+        except Exception as exc:
+            add_check("ax_platform_symlink", "warning", f"Could not inspect plugin symlink: {exc}")
+
+        try:
+            hermes_home = _hermes_plugin_home(entry)
+            cfg_path = hermes_home / "config.yaml"
+            if cfg_path.exists():
+                import yaml as _yaml  # local — gateway import cost
+
+                try:
+                    loaded = _yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+                except Exception as exc:
+                    loaded = None
+                    parse_error = exc
+                else:
+                    parse_error = None
+                if not isinstance(loaded, dict):
+                    if parse_error is not None:
+                        add_check(
+                            "ax_platform_enabled",
+                            "failed",
+                            f"{cfg_path} did not parse as YAML: {parse_error}",
+                        )
+                    else:
+                        add_check(
+                            "ax_platform_enabled",
+                            "failed",
+                            f"{cfg_path} is not a YAML mapping.",
+                        )
+                else:
+                    plugins_cfg = loaded.get("plugins")
+                    enabled_list = plugins_cfg.get("enabled") if isinstance(plugins_cfg, dict) else None
+                    if isinstance(enabled_list, list) and AX_PLUGIN_NAME in enabled_list:
+                        add_check(
+                            "ax_platform_enabled",
+                            "passed",
+                            f"`plugins.enabled` contains `{AX_PLUGIN_NAME}` (Hermes will load the adapter).",
+                        )
+                    else:
+                        add_check(
+                            "ax_platform_enabled",
+                            "failed",
+                            f"`plugins.enabled` in {cfg_path} does not contain `{AX_PLUGIN_NAME}`. "
+                            f"Hermes is opt-in for user plugins; without this the runtime comes up "
+                            f"but logs `No messaging platforms enabled` and never replies.",
+                        )
+            else:
+                add_check(
+                    "ax_platform_enabled",
+                    "failed",
+                    f"{cfg_path} is missing. Run `ax gateway agents start {entry.get('name') or '<name>'}` "
+                    f"to trigger the scaffold.",
+                )
+        except Exception as exc:
+            add_check("ax_platform_enabled", "warning", f"Could not inspect per-agent config.yaml: {exc}")
+
     if str(snapshot.get("mode") or "") == "LIVE":
         if str(snapshot.get("presence") or "") == "IDLE":
             add_check("live_path", "passed", "Live listener is connected.")
@@ -3612,13 +4066,25 @@ def _spaces_payload() -> dict:
     return payload
 
 
-def _move_managed_agent_space(name: str, new_space_id: str) -> dict:
+def _move_managed_agent_space(name: str, new_space_id: str | None, *, revert: bool = False) -> dict:
     name = name.strip()
-    new_space_id = new_space_id.strip()
     if not name:
         raise ValueError("Managed agent name is required.")
-    if not new_space_id:
-        raise ValueError("Target space is required.")
+    if revert:
+        if new_space_id and new_space_id.strip():
+            raise ValueError("Pass either --space or --revert, not both.")
+        registry_for_revert = load_gateway_registry()
+        revert_entry = find_agent_entry(registry_for_revert, name)
+        if not revert_entry:
+            raise LookupError(f"Managed agent not found: {name}")
+        previous = str(revert_entry.get("previous_space_id") or "").strip()
+        if not previous:
+            raise ValueError(f"@{name} has no recorded previous space to revert to. Use --space <id> instead.")
+        new_space_id = previous
+    else:
+        new_space_id = (new_space_id or "").strip()
+        if not new_space_id:
+            raise ValueError("Target space is required.")
     client = _load_gateway_user_client()
     new_space_id = resolve_space_id(client, explicit=new_space_id)
     registry = load_gateway_registry()
@@ -3703,10 +4169,26 @@ def _move_managed_agent_space(name: str, new_space_id: str) -> dict:
             # Resync best-effort; the placement write already succeeded.
             continue
     previous_space_id = str(entry.get("space_id") or "").strip() or None
+    previous_space_name = str(entry.get("active_space_name") or entry.get("space_name") or "").strip() or None
     if backend_allowed_spaces is not None:
         entry["allowed_spaces"] = backend_allowed_spaces
     apply_entry_current_space(entry, backend_space_id, space_name=backend_space_name)
     ensure_gateway_identity_binding(registry, entry, session=load_gateway_session())
+    # Persist the prior space so `ax gateway agents move <name> --revert` can
+    # find its way back without the operator needing to remember the UUID.
+    # Only record when the move actually changed spaces — a no-op move
+    # (already in the requested space) shouldn't blank the revert pointer.
+    if previous_space_id and previous_space_id != backend_space_id:
+        entry["previous_space_id"] = previous_space_id
+        if previous_space_name:
+            entry["previous_space_name"] = previous_space_name
+    # Mark the entry as moving for any concurrent send guard / UI panel that
+    # reads `current_status`. Cleared once the rebind wait below resolves
+    # (or the deadline elapses) so a stuck move doesn't permanently freeze
+    # sends. The send guard itself raises off `_identity_space_send_guard`
+    # via `annotate_runtime_health`; this surface is for human-readable text.
+    entry["current_status"] = "moving"
+    entry["current_activity"] = f"Moving to {backend_space_name or backend_space_id}; sends paused until reconnect."
     # Capture the rebind marker BEFORE writing the registry so the wait below
     # is guaranteed to see only post-move runtime/listener events.
     rebind_marker = datetime.now(timezone.utc).isoformat()
@@ -3747,6 +4229,19 @@ def _move_managed_agent_space(name: str, new_space_id: str) -> dict:
             if any((event.get("ts") or "") > rebind_marker and event.get("event") in ready_events for event in recent):
                 break
             time.sleep(0.2)
+    # Reconnect window has resolved (or its 5s deadline elapsed). Clear the
+    # human-readable "moving" status so subsequent sends through the
+    # send-guard read normal state. Re-read the registry first because a
+    # concurrent runtime/listener event may have already updated the entry.
+    registry_after = load_gateway_registry()
+    settled = find_agent_entry(registry_after, name)
+    if settled is not None and str(settled.get("current_status") or "") == "moving":
+        settled["current_status"] = None
+        settled["current_activity"] = None
+        save_gateway_registry(registry_after)
+        # Mirror onto the local entry so the return value reflects the cleared state.
+        entry["current_status"] = None
+        entry["current_activity"] = None
     return annotate_runtime_health(entry, registry=registry)
 
 
@@ -5294,12 +5789,39 @@ def _read_json_request(handler: BaseHTTPRequestHandler) -> dict:
     return payload
 
 
+_LOOPBACK_HOSTNAMES = frozenset({"localhost", "127.0.0.1"})
+
+
+def _is_request_host_allowed(host_header: str | None) -> bool:
+    # Block DNS-rebinding: only accept Host headers that resolve to loopback.
+    # Port is left open so `ax gateway start --port` keeps working.
+    if not host_header:
+        return False
+    candidate = host_header.strip()
+    if not candidate:
+        return False
+    hostname = candidate.rsplit(":", 1)[0] if ":" in candidate else candidate
+    return hostname.lower() in _LOOPBACK_HOSTNAMES
+
+
 def _build_gateway_ui_handler(*, activity_limit: int, refresh_ms: int):
     class GatewayUiHandler(BaseHTTPRequestHandler):
         def log_message(self, format: str, *args) -> None:  # noqa: A003
             return
 
+        def _reject_unauthorized_host(self) -> bool:
+            if _is_request_host_allowed(self.headers.get("Host")):
+                return False
+            _write_json_response(
+                self,
+                {"error": "Forbidden: Host header is not loopback."},
+                status=HTTPStatus.FORBIDDEN,
+            )
+            return True
+
         def do_GET(self) -> None:  # noqa: N802
+            if self._reject_unauthorized_host():
+                return
             parsed = urlparse(self.path)
             if parsed.path == "/":
                 _write_html_response(self, _render_gateway_demo_page(refresh_ms=refresh_ms))
@@ -5422,6 +5944,8 @@ def _build_gateway_ui_handler(*, activity_limit: int, refresh_ms: int):
             _write_json_response(self, {"error": "not found"}, status=HTTPStatus.NOT_FOUND)
 
         def do_POST(self) -> None:  # noqa: N802
+            if self._reject_unauthorized_host():
+                return
             parsed = urlparse(self.path)
             try:
                 body = _read_json_request(self)
@@ -5629,6 +6153,20 @@ def _build_gateway_ui_handler(*, activity_limit: int, refresh_ms: int):
                         return
                     _write_json_response(self, payload)
                     return
+                if parsed.path.endswith("/external-runtime-announce") and parsed.path.startswith("/api/agents/"):
+                    name = unquote(
+                        parsed.path.removeprefix("/api/agents/").removesuffix("/external-runtime-announce")
+                    ).strip()
+                    try:
+                        payload = _announce_external_agent_runtime(name, body)
+                    except LookupError as exc:
+                        _write_json_response(self, {"error": str(exc)}, status=HTTPStatus.NOT_FOUND)
+                        return
+                    except ValueError as exc:
+                        _write_json_response(self, {"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                        return
+                    _write_json_response(self, payload)
+                    return
                 if parsed.path.endswith("/send") and parsed.path.startswith("/api/agents/"):
                     name = unquote(parsed.path.removeprefix("/api/agents/").removesuffix("/send")).strip()
                     payload = _send_from_managed_agent(
@@ -5636,6 +6174,9 @@ def _build_gateway_ui_handler(*, activity_limit: int, refresh_ms: int):
                         content=str(body.get("content") or ""),
                         to=str(body.get("to") or "").strip() or None,
                         parent_id=str(body.get("parent_id") or "").strip() or None,
+                        # UI has its own inbox panel that polls separately;
+                        # don't make every UI send block on a 2s post-send poll.
+                        inbox_wait=0,
                     )
                     _write_json_response(self, payload, status=HTTPStatus.CREATED)
                     return
@@ -6903,6 +7444,40 @@ def local_connect(
         console.print(f"  expires  = {payload.get('expires_at')}")
 
 
+def _ensure_workdir(path: Path, *, create: bool, raw_input: str | None = None) -> None:
+    """Validate or provision a workdir for a folder-bound Gateway identity.
+
+    The workdir is the durable binding for a Gateway agent — one folder maps
+    to one registry row. Silently creating a directory the operator did not
+    intend is exactly the surprise this guard exists to prevent: a typo in
+    ``--workdir`` should not mint a fresh empty folder somewhere unexpected
+    and then attach an agent identity to it.
+
+    * If the path exists and is a directory, return.
+    * If the path exists but is a file, error.
+    * If the path does not exist and ``create`` is True, create it (with any
+      missing parent directories).
+    * If the path does not exist and ``create`` is False, error with an
+      actionable hint pointing at ``--create-workdir``.
+    """
+    label = raw_input if raw_input and raw_input != str(path) else str(path)
+    if path.exists():
+        if not path.is_dir():
+            raise typer.BadParameter(f"--workdir {label!r} exists but is not a directory: {path}")
+        return
+    if not create:
+        raise typer.BadParameter(
+            f"--workdir {label!r} does not exist: {path}\n"
+            "Pass --create-workdir to create it, or pick an existing folder. "
+            "One folder maps to one Gateway identity, so the workdir should be a "
+            "real workspace you intend the agent to operate in."
+        )
+    try:
+        path.mkdir(parents=True, exist_ok=False)
+    except OSError as exc:
+        raise typer.BadParameter(f"Could not create --workdir {path}: {exc}") from exc
+
+
 def _gateway_local_config_text(*, agent_name: str, gateway_url: str, workdir: str | None = None) -> str:
     lines = [
         "[gateway]",
@@ -6978,6 +7553,47 @@ def _resolve_local_gateway_identity(
     return requested_agent or None, requested_ref or None
 
 
+def _local_route_failure_guidance(
+    *,
+    detail: str,
+    status_code: int | None,
+    gateway_url: str,
+    agent_name: str | None,
+    workdir: str | None,
+    action: str,
+) -> str:
+    """Build an actionable error message for /local/connect or /local/proxy failures.
+
+    The bare ``Gateway local connect failed: not found`` text from a 404 leaves
+    the operator with no idea what to try next — it doesn't even hint that the
+    workspace might be bound to a Live Listener (claude_code_channel, hermes)
+    that uses direct identity instead of the local-connect protocol.
+
+    For 404s we surface that and suggest the obvious recovery commands. For
+    other statuses we keep the message terse but still point at the Gateway UI.
+    """
+    name = (agent_name or "").strip()
+    subject = f"@{name}" if name else "this workspace"
+    base_url = gateway_url.rstrip("/")
+    detail_text = (detail or "").strip() or "no detail returned"
+    parts = [f"Gateway {action} failed for {subject}: {detail_text}."]
+    if status_code == 404:
+        parts.append(
+            "Either no Gateway binding is registered for this workspace, "
+            "or the workspace is bound to a Live Listener "
+            "(claude_code_channel, hermes, etc.) which uses direct identity, "
+            "not local-connect/proxy."
+        )
+        suggestions = ["ax gateway agents list --json"]
+        if name and workdir:
+            suggestions.append(f"ax gateway local connect {name} --workdir {workdir}")
+        elif name:
+            suggestions.append(f"ax gateway local connect {name}")
+        parts.append("Try: " + "; ".join(suggestions) + ".")
+    parts.append(f"Or open {base_url} to inspect Gateway agents.")
+    return " ".join(parts)
+
+
 def _approval_required_guidance(
     *,
     connect_payload: dict,
@@ -7032,13 +7648,37 @@ def _approval_required_guidance(
 def local_init(
     agent_name: str = typer.Argument(..., help="Local Gateway agent name"),
     gateway_url: str = typer.Option("http://127.0.0.1:8765", "--url", help="Local Gateway UI/API URL"),
-    workdir: str = typer.Option(None, "--workdir", help="Workspace folder to configure; defaults to CWD"),
+    workdir: str = typer.Option(
+        None,
+        "--workdir",
+        help=(
+            "Workspace folder to configure; defaults to CWD. One folder maps to one durable "
+            "Gateway identity. The folder must already exist; pass --create-workdir to create it."
+        ),
+    ),
+    create_workdir: bool = typer.Option(
+        False,
+        "--create-workdir",
+        help=(
+            "Create the workdir (and any missing parent directories) instead of failing when "
+            "it doesn't exist. Use when you are intentionally provisioning a new workspace."
+        ),
+    ),
     connect: bool = typer.Option(True, "--connect/--no-connect", help="Immediately request Gateway approval/session"),
     force: bool = typer.Option(False, "--force", help="Overwrite an existing .ax/config.toml"),
     as_json: bool = JSON_OPTION,
 ):
-    """Write a Gateway-native local config that contains no PAT or token file."""
-    root = Path(workdir or Path.cwd()).expanduser().resolve()
+    """Write a Gateway-native local config that contains no PAT or token file.
+
+    The workdir is the durable binding for this Gateway identity: one folder
+    or container maps to exactly one registry row. By default the workdir
+    must already exist — bind to a real workspace, do not let the CLI silently
+    fabricate one. Pass ``--create-workdir`` when you are intentionally
+    provisioning a new folder for the agent.
+    """
+    raw_workdir = workdir or str(Path.cwd())
+    root = Path(raw_workdir).expanduser().resolve()
+    _ensure_workdir(root, create=create_workdir, raw_input=raw_workdir)
     ax_dir = root / ".ax"
     config_path = ax_dir / "config.toml"
     if config_path.exists() and not force:
@@ -7118,9 +7758,27 @@ def _request_local_connect(
             detail = exc.response.json().get("error", detail)
         except Exception:
             pass
-        raise ValueError(f"Gateway local connect failed: {detail}") from exc
+        raise ValueError(
+            _local_route_failure_guidance(
+                detail=detail,
+                status_code=exc.response.status_code,
+                gateway_url=gateway_url,
+                agent_name=display_name,
+                workdir=resolved_workdir,
+                action="local connect",
+            )
+        ) from exc
     except Exception as exc:
-        raise ValueError(f"Gateway local connect failed: {exc}") from exc
+        raise ValueError(
+            _local_route_failure_guidance(
+                detail=str(exc),
+                status_code=None,
+                gateway_url=gateway_url,
+                agent_name=display_name,
+                workdir=resolved_workdir,
+                action="local connect",
+            )
+        ) from exc
     return payload
 
 
@@ -7276,7 +7934,13 @@ def local_send(
         None, "--session-token", envvar="AX_GATEWAY_SESSION", help="Gateway session token"
     ),
     content: str = typer.Argument(..., help="Message content"),
-    space_id: str = typer.Option(None, "--space-id", help="Space to send into"),
+    space_id: str = typer.Option(
+        None,
+        "--space",
+        "--space-id",
+        "-s",
+        help="Space to send into. Accepts a slug, name, or UUID; slug/name resolves through the local space cache.",
+    ),
     agent_name: str = typer.Option(
         None, "--agent", "--name", help="Approved local pass-through agent to connect as if no session token is set"
     ),
@@ -7298,9 +7962,32 @@ def local_send(
         help="Seconds to wait for inbound messages after sending. Use 0 to only check immediately.",
     ),
     inbox_limit: int = typer.Option(10, "--inbox-limit", min=1, max=100, help="Max inbound messages to return."),
+    session_proof: str = typer.Option(
+        None,
+        "--session-proof",
+        help=(
+            "Echo back the challenge code Gateway issued on the previous send. "
+            "Only required when AX_GATEWAY_SESSION_CHALLENGE is enabled on the Gateway "
+            "(opt-in session-continuity test). On a successful send under the flag, the "
+            "response includes next_session_proof for the following call."
+        ),
+    ),
     as_json: bool = JSON_OPTION,
 ):
-    """Send through an approved local pass-through Gateway session."""
+    """Send through an approved local pass-through Gateway session.
+
+    The ``--space`` option accepts a slug, name, or UUID. Slugs and names
+    resolve through the local space cache so pass-through agents do not
+    need a user PAT just to translate a friendly name into a UUID.
+    """
+    if space_id:
+        resolved = _resolve_space_via_cache(space_id)
+        if resolved is None:
+            raise typer.BadParameter(
+                f"Could not resolve space '{space_id}' from the local space cache. "
+                "Pass a UUID, or run `ax spaces list` once from the user side to populate the cache."
+            )
+        space_id = resolved
     try:
         resolved_session_token, connect_payload = _resolve_local_gateway_session(
             session_token=session_token,
@@ -7320,6 +8007,8 @@ def local_send(
     )
 
     body = {"content": content, "space_id": space_id, "parent_id": parent_id}
+    if session_proof:
+        body["session_proof"] = session_proof.strip()
     try:
         response = httpx.post(
             f"{gateway_url.rstrip('/')}/local/send",
@@ -7335,6 +8024,12 @@ def local_send(
             detail = exc.response.json().get("error", detail)
         except Exception:
             pass
+        # Surface session-challenge errors so the operator can see the code
+        # and the next step without sifting through generic "send failed" text.
+        if isinstance(detail, str) and (
+            detail.startswith("session_challenge_required:") or detail.startswith("invalid_session_proof:")
+        ):
+            raise typer.BadParameter(detail) from exc
         raise typer.BadParameter(f"Gateway local send failed: {detail}") from exc
     except Exception as exc:
         raise typer.BadParameter(f"Gateway local send failed: {exc}") from exc
@@ -7372,6 +8067,11 @@ def local_send(
         print_json(payload)
         return
     console.print(f"[green]Sent through Gateway[/green] as @{payload.get('agent')}")
+    if payload.get("next_session_proof"):
+        console.print(
+            f"[cyan]Next session-proof:[/cyan] {payload['next_session_proof']} "
+            "(echo this with --session-proof on the next send)"
+        )
     _print_pending_reply_warning_local(pending)
     inbox_payload = payload.get("inbox") if isinstance(payload.get("inbox"), dict) else {}
     messages = inbox_payload.get("messages") if isinstance(inbox_payload, dict) else []
@@ -7395,7 +8095,13 @@ def local_inbox(
     ),
     limit: int = typer.Option(20, "--limit", min=1, max=100, help="Max messages to return"),
     channel: str = typer.Option("main", "--channel", help="Message channel"),
-    space_id: str = typer.Option(None, "--space-id", help="Space to poll"),
+    space_id: str = typer.Option(
+        None,
+        "--space",
+        "--space-id",
+        "-s",
+        help="Space to poll. Accepts a slug, name, or UUID; slug/name resolves through the local space cache.",
+    ),
     agent_name: str = typer.Option(
         None, "--agent", "--name", help="Approved local pass-through agent to connect as if no session token is set"
     ),
@@ -7424,7 +8130,20 @@ def local_inbox(
     gateway_url: str = typer.Option("http://127.0.0.1:8765", "--url", help="Local Gateway UI/API URL"),
     as_json: bool = JSON_OPTION,
 ):
-    """Poll an approved local pass-through Gateway inbox."""
+    """Poll an approved local pass-through Gateway inbox.
+
+    The ``--space`` option accepts a slug, name, or UUID. Slugs and names
+    resolve through the local space cache; pass-through agents do not need
+    a user PAT for the lookup.
+    """
+    if space_id:
+        resolved = _resolve_space_via_cache(space_id)
+        if resolved is None:
+            raise typer.BadParameter(
+                f"Could not resolve space '{space_id}' from the local space cache. "
+                "Pass a UUID, or run `ax spaces list` once from the user side to populate the cache."
+            )
+        space_id = resolved
     try:
         resolved_session_token, connect_payload = _resolve_local_gateway_session(
             session_token=session_token,
@@ -7487,12 +8206,18 @@ def add_agent(
     runtime_type: str = typer.Option(
         None,
         "--type",
-        help="Advanced/internal runtime backend: echo | exec | hermes_sentinel | sentinel_cli | claude_code_channel | inbox",
+        help="Advanced/internal runtime backend: echo | exec | hermes_plugin | hermes_sentinel | sentinel_cli | claude_code_channel | inbox",
     ),
     exec_cmd: str = typer.Option(None, "--exec", help="Advanced override for exec-based templates"),
     workdir: str = typer.Option(None, "--workdir", help="Advanced working directory override"),
     ollama_model: str = typer.Option(None, "--ollama-model", help="Ollama model override for the Ollama template"),
-    space_id: str = typer.Option(None, "--space-id", help="Target space (defaults to gateway session)"),
+    space_id: str = typer.Option(
+        None,
+        "--space",
+        "--space-id",
+        "-s",
+        help="Target space (defaults to gateway session). Accepts a slug, name, or UUID.",
+    ),
     audience: str = typer.Option("both", "--audience", help="Minted PAT audience"),
     description: str = typer.Option(None, "--description", help="Create/update description"),
     model: str = typer.Option(None, "--model", help="Create/update model"),
@@ -7509,10 +8234,43 @@ def add_agent(
     timeout_seconds: int = typer.Option(
         None, "--timeout", "--timeout-seconds", help="Max seconds a runtime may process one message"
     ),
+    allow_all_users: bool = typer.Option(
+        False,
+        "--allow-all-users",
+        help=(
+            "Hermes plugin runtime only: open the agent to mentions from anyone in its space. "
+            "Sets AX_ALLOW_ALL_USERS=1 + GATEWAY_ALLOW_ALL_USERS=true in the scaffolded "
+            "HERMES_HOME/.env. Default-closed; without this (or --allowed-users) the agent "
+            "denies all incoming mentions."
+        ),
+    ),
+    allowed_users: str = typer.Option(
+        None,
+        "--allowed-users",
+        help="Hermes plugin runtime only: comma-separated agent/user names allowed to mention this agent.",
+    ),
     start: bool = typer.Option(True, "--start/--no-start", help="Desired running state after registration"),
     as_json: bool = JSON_OPTION,
 ):
-    """Register a managed agent and mint a Gateway-owned PAT for it."""
+    """Register a managed agent and mint a Gateway-owned PAT for it.
+
+    The ``--space`` option accepts a slug, name, or UUID. Slug/name resolution
+    runs through the local space cache first; if that misses, the resolution
+    falls through to the gateway user client's ``list_spaces`` lookup.
+    """
+    if space_id:
+        cached = _resolve_space_via_cache(space_id)
+        if cached is not None:
+            space_id = cached
+        else:
+            try:
+                client = _load_gateway_user_client()
+                space_id = resolve_space_id(client, explicit=space_id)
+            except (typer.Exit, typer.BadParameter):
+                raise
+            except Exception as exc:
+                err_console.print(f"[red]Could not resolve space '{space_id}': {exc}[/red]")
+                raise typer.Exit(1)
     selected_template = template_id or ("echo_test" if not runtime_type else None)
     try:
         resolved_prompt = _resolve_system_prompt_input(
@@ -7533,6 +8291,8 @@ def add_agent(
             model=model,
             system_prompt=resolved_prompt,
             timeout_seconds=timeout_seconds,
+            allow_all_users=allow_all_users,
+            allowed_users=allowed_users,
             start=start,
         )
     except (ValueError, LookupError) as exc:
@@ -7560,7 +8320,7 @@ def update_agent(
     runtime_type: str = typer.Option(
         None,
         "--type",
-        help="Advanced/internal runtime backend override: echo | exec | hermes_sentinel | sentinel_cli | claude_code_channel | inbox",
+        help="Advanced/internal runtime backend override: echo | exec | hermes_plugin | hermes_sentinel | sentinel_cli | claude_code_channel | inbox",
     ),
     exec_cmd: str = typer.Option(None, "--exec", help="Advanced override for exec-based templates"),
     workdir: str = typer.Option(None, "--workdir", help="Advanced working directory override"),
@@ -7579,6 +8339,23 @@ def update_agent(
     ),
     timeout_seconds: int = typer.Option(
         None, "--timeout", "--timeout-seconds", help="Max seconds a runtime may process one message"
+    ),
+    allow_all_users: bool = typer.Option(
+        None,
+        "--allow-all-users/--no-allow-all-users",
+        help=(
+            "Hermes plugin runtime only: open the agent to mentions from anyone in its space "
+            "(or close it back down). Sets AX_ALLOW_ALL_USERS / GATEWAY_ALLOW_ALL_USERS in "
+            "the scaffolded HERMES_HOME/.env on the next start."
+        ),
+    ),
+    allowed_users: str = typer.Option(
+        None,
+        "--allowed-users",
+        help=(
+            "Hermes plugin runtime only: comma-separated agent/user names allowed to mention this agent. "
+            "Pass an empty string to clear."
+        ),
     ),
     desired_state: str = typer.Option(None, "--desired-state", help="running | stopped"),
     as_json: bool = JSON_OPTION,
@@ -7607,6 +8384,8 @@ def update_agent(
             model=model,
             system_prompt=resolved_prompt,
             timeout_seconds=timeout_seconds if timeout_seconds is not None else _UNSET,
+            allow_all_users=allow_all_users if allow_all_users is not None else _UNSET,
+            allowed_users=allowed_users if allowed_users is not None else _UNSET,
             desired_state=desired_state,
         )
     except (LookupError, ValueError) as exc:
@@ -7715,12 +8494,29 @@ def test_agent(
 @agents_app.command("move")
 def move_agent(
     name: str = typer.Argument(..., help="Managed agent name"),
-    space_id: str = typer.Option(..., "--space", "--space-id", "-s", help="Target space slug, name, or id"),
+    space_id: str = typer.Option(None, "--space", "--space-id", "-s", help="Target space slug, name, or id"),
+    revert: bool = typer.Option(
+        False,
+        "--revert",
+        help=(
+            "Move the agent back to its previous space. "
+            "Mutually exclusive with --space; requires a prior move on this entry."
+        ),
+    ),
     as_json: bool = JSON_OPTION,
 ):
-    """Move a Gateway-managed agent to another allowed space."""
+    """Move a Gateway-managed agent to another allowed space.
+
+    Pass ``--space`` to move to a specific space, or ``--revert`` to move
+    back to the previously-recorded space without retyping its id. The
+    revert pointer is captured automatically on every successful move,
+    so the standard "move out, move back" loop works without bookkeeping.
+    """
+    if not revert and not (space_id and space_id.strip()):
+        err_console.print("[red]Provide --space or --revert.[/red]")
+        raise typer.Exit(1)
     try:
-        result = _move_managed_agent_space(name, space_id)
+        result = _move_managed_agent_space(name, space_id, revert=revert)
     except (LookupError, ValueError) as exc:
         err_console.print(f"[red]{exc}[/red]")
         raise typer.Exit(1)
@@ -7733,6 +8529,9 @@ def move_agent(
     err_console.print(
         f"  space = {result.get('active_space_name') or result.get('active_space_id') or result.get('space_id')}"
     )
+    if result.get("previous_space_id"):
+        previous_label = result.get("previous_space_name") or result.get("previous_space_id")
+        err_console.print(f"  previous = {previous_label} (use --revert to move back)")
 
 
 @agents_app.command("doctor")
@@ -7764,11 +8563,34 @@ def send_as_agent(
     content: str = typer.Argument(..., help="Message content"),
     to: str = typer.Option(None, "--to", help="Prepend a mention like @codex automatically"),
     parent_id: str = typer.Option(None, "--parent-id", help="Reply inside an existing thread"),
+    include_inbox: bool = typer.Option(
+        True,
+        "--inbox/--no-inbox",
+        help="After sending, include unread messages addressed to this agent in the response. "
+        "Default ON so two agents don't talk past each other when one replies while the other is mid-draft.",
+    ),
+    inbox_wait: int = typer.Option(
+        2,
+        "--inbox-wait",
+        min=0,
+        help="Seconds to wait for inbound messages after sending. 0 only checks immediately.",
+    ),
+    inbox_limit: int = typer.Option(
+        10, "--inbox-limit", min=1, max=100, help="Max inbound messages to bundle in the response."
+    ),
     as_json: bool = JSON_OPTION,
 ):
     """Send a message as a Gateway-managed agent."""
     try:
-        result = _send_from_managed_agent(name=name, content=content, to=to, parent_id=parent_id)
+        result = _send_from_managed_agent(
+            name=name,
+            content=content,
+            to=to,
+            parent_id=parent_id,
+            include_inbox=include_inbox,
+            inbox_wait=inbox_wait,
+            inbox_limit=inbox_limit,
+        )
     except ValueError as exc:
         err_console.print(f"[red]{exc}[/red]")
         raise typer.Exit(1)
@@ -7780,6 +8602,21 @@ def send_as_agent(
     if isinstance(result["message"], dict) and result["message"].get("id"):
         err_console.print(f"  id = {result['message']['id']}")
     err_console.print(f"  content = {result['content']}")
+    inbox = result.get("inbox") if isinstance(result.get("inbox"), dict) else None
+    if inbox:
+        unread = inbox.get("unread_count") or 0
+        if unread:
+            err_console.print(
+                f"[yellow]Inbox while drafting:[/yellow] {unread} unread message(s) addressed to @{result['agent']}"
+            )
+            for msg in (inbox.get("messages") or [])[:5]:
+                if not isinstance(msg, dict):
+                    continue
+                sender = msg.get("agent_name") or msg.get("user_name") or msg.get("sender") or "unknown"
+                preview = str(msg.get("content") or "").strip().splitlines()[0][:120] if msg.get("content") else ""
+                err_console.print(f"  - @{sender}: {preview}")
+    elif result.get("inbox_error"):
+        err_console.print(f"[dim]Inbox poll failed: {result['inbox_error']}[/dim]")
 
 
 @agents_app.command("inbox")
@@ -7787,7 +8624,13 @@ def inbox_for_agent(
     name: str = typer.Argument(..., help="Managed agent name"),
     limit: int = typer.Option(20, "--limit", min=1, max=200, help="Max messages to return"),
     channel: str = typer.Option("main", "--channel", help="Message channel"),
-    space_id: str = typer.Option(None, "--space-id", help="Override the agent's home space"),
+    space_id: str = typer.Option(
+        None,
+        "--space",
+        "--space-id",
+        "-s",
+        help="Override the agent's home space. Accepts a slug, name, or UUID.",
+    ),
     unread_only: bool = typer.Option(
         False,
         "--unread-only/--all",
@@ -7809,7 +8652,20 @@ def inbox_for_agent(
     agents — uses the agent's Gateway-loaded credentials, so no PAT is exposed
     to the caller. Pairs with `ax gateway agents send` for a uniform read/write
     surface from any operator seat without needing the channel MCP attached.
+
+    The ``--space`` option accepts a slug, name, or UUID. Slugs and names
+    resolve through the local space cache; the operator's user PAT is not
+    required for this lookup.
     """
+    if space_id:
+        resolved = _resolve_space_via_cache(space_id)
+        if resolved is None:
+            err_console.print(
+                f"[red]Could not resolve space '{space_id}' from the local space cache. "
+                "Pass a UUID, or run `ax spaces list` once to populate the cache.[/red]"
+            )
+            raise typer.Exit(1)
+        space_id = resolved
     try:
         result = _inbox_for_managed_agent(
             name=name,

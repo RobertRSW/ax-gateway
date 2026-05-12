@@ -235,6 +235,28 @@ def test_parse_json_names_agent_create_html_shell_as_api_contract_failure():
     assert "name conflict" in message
 
 
+def test_parse_json_names_send_message_html_shell_as_routing_failure():
+    """Parallel of the agents-create case: when the hosted SPA captures
+    POST /api/v1/messages, the CLI cannot post reply metadata, so the
+    error message names that consequence rather than the generic
+    'frontend may be catching this route' hint."""
+    client = AxClient("https://example.com", "legacy-token")
+    response = httpx.Response(
+        200,
+        text="<!DOCTYPE html><html></html>",
+        headers={"content-type": "text/html"},
+        request=httpx.Request("POST", "https://example.com/api/v1/messages"),
+    )
+
+    with pytest.raises(httpx.HTTPStatusError) as exc:
+        client._parse_json(response)
+
+    message = str(exc.value)
+    assert "Send-message returned HTML instead of JSON" in message
+    assert "parent_id" in message
+    assert "agent-to-agent reply routing" in message
+
+
 def test_record_tool_call_posts_audit_payload():
     client = AxClient("https://example.com", "legacy-token", agent_id="agent-123", agent_name="codex")
     response = httpx.Response(
@@ -416,6 +438,43 @@ class TestCredentialManagement:
         body = client._http.post.call_args.kwargs["json"]
         assert body["agent_scope"] == "agents"
         assert body["allowed_agent_ids"] == ["agent-123"]
+
+    def test_create_key_with_bound_agent_id(self):
+        client = AxClient("https://example.com", "axp_u_UserKey.UserSecret")
+        response = httpx.Response(
+            201,
+            json={"credential_id": "cred-1", "token": "axp_a_…"},
+            request=httpx.Request("POST", "https://example.com/api/v1/keys"),
+        )
+        client._http.post = MagicMock(return_value=response)
+
+        client.create_key("bound-key", bound_agent_id="a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11")
+
+        body = client._http.post.call_args.kwargs["json"]
+        assert body["name"] == "bound-key"
+        assert body["bound_agent_id"] == "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"
+        assert "agent_scope" not in body
+
+    def test_create_key_with_bound_agent_id_and_scope(self):
+        client = AxClient("https://example.com", "axp_u_UserKey.UserSecret")
+        response = httpx.Response(
+            201,
+            json={},
+            request=httpx.Request("POST", "https://example.com/api/v1/keys"),
+        )
+        client._http.post = MagicMock(return_value=response)
+
+        agent_uuid = "b1eebc99-9c0b-4ef8-bb6d-6bb9bd380a22"
+        client.create_key(
+            "combo",
+            allowed_agent_ids=[agent_uuid],
+            bound_agent_id=agent_uuid,
+        )
+
+        body = client._http.post.call_args.kwargs["json"]
+        assert body["agent_scope"] == "agents"
+        assert body["allowed_agent_ids"] == [agent_uuid]
+        assert body["bound_agent_id"] == agent_uuid
 
     def test_create_task_sends_assignee_id_in_body(self):
         client = AxClient("https://example.com", "legacy-token", agent_id="creator-agent")

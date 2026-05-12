@@ -569,6 +569,36 @@ def _enrich_prompt_for_agent(
     return prompt.rstrip() + "\n\n---\n" + "\n\n".join(blocks)
 
 
+def _format_inbox_bundle_for_mcp(bundle: dict[str, Any]) -> str:
+    """Render an inbox bundle (from `_poll_channel_inbox_after_reply`) as a
+    human-readable second text item for an MCP tool response.
+
+    Shape matches what an LLM caller can act on directly: a one-line summary
+    of the unread count, then per-message lines with sender + first-line
+    preview. Capped at 5 messages in the body to keep the response compact —
+    the full list is still in the bundle if a richer client wants it.
+    """
+    messages = bundle.get("messages") or []
+    unread_count = bundle.get("unread_count") or len(messages)
+    lines = [
+        f"INBOX while you were drafting: {unread_count} unread message(s) addressed to @{bundle.get('agent') or 'this agent'}.",
+    ]
+    for msg in messages[:5]:
+        if not isinstance(msg, dict):
+            continue
+        sender = msg.get("agent_name") or msg.get("user_name") or msg.get("sender") or "unknown"
+        msg_id = msg.get("id") or msg.get("message_id") or ""
+        first_line = ""
+        content = msg.get("content")
+        if isinstance(content, str) and content.strip():
+            first_line = content.strip().splitlines()[0][:160]
+        suffix = f" ({msg_id})" if msg_id else ""
+        lines.append(f"  - @{sender}{suffix}: {first_line}")
+    if len(messages) > 5:
+        lines.append(f"  ... and {len(messages) - 5} more (full list in bundle).")
+    return "\n".join(lines)
+
+
 class ChannelBridge:
     def __init__(
         self,
@@ -770,7 +800,11 @@ class ChannelBridge:
                 "tools": [
                     {
                         "name": "reply",
-                        "description": "Reply to an aX channel message in-thread.",
+                        "description": (
+                            "Reply to an aX channel message in-thread. The response includes any "
+                            "aX messages that arrived addressed to this agent while the reply was "
+                            "being composed, so two agents don't talk past each other."
+                        ),
                         "inputSchema": {
                             "type": "object",
                             "properties": {
@@ -778,6 +812,24 @@ class ChannelBridge:
                                 "reply_to": {
                                     "type": "string",
                                     "description": "aX message_id to reply to. Defaults to the latest inbound message.",
+                                },
+                                "inbox": {
+                                    "type": "boolean",
+                                    "description": (
+                                        "Include unread messages addressed to this agent in the response. "
+                                        "Default true; pass false to skip the post-send inbox poll."
+                                    ),
+                                },
+                                "inbox_wait": {
+                                    "type": "number",
+                                    "description": (
+                                        "Seconds to wait for inbound messages after sending. "
+                                        "Default 2; 0 only checks immediately."
+                                    ),
+                                },
+                                "inbox_limit": {
+                                    "type": "number",
+                                    "description": "Max inbound messages to bundle (default 10).",
                                 },
                             },
                             "required": ["text"],
@@ -916,17 +968,40 @@ class ChannelBridge:
                 last_work_completed_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                 backlog_depth=self.mention_queue.qsize(),
             )
-            await self.send_response(
-                request_id,
+
+            # Bundle "what arrived while you were drafting" into the response.
+            # Same intent as `_send_from_managed_agent`'s inbox bundling for
+            # the CLI agents-send path: closes aX task 663d9e6f. Default ON;
+            # the caller can pass {"inbox": false} to skip.
+            include_inbox = arguments.get("inbox") is not False
+            inbox_bundle = None
+            inbox_error = None
+            if include_inbox and self.agent_id:
+                try:
+                    inbox_bundle = await self._poll_channel_inbox_after_reply(
+                        wait_seconds=int(arguments.get("inbox_wait", 2) or 0),
+                        limit=int(arguments.get("inbox_limit", 10) or 10),
+                    )
+                except Exception as exc:
+                    inbox_error = str(exc)
+
+            response_content: list[dict[str, Any]] = [
                 {
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": f"sent reply to {reply_to}" + (f" ({sent_id})" if sent_id else ""),
-                        }
-                    ]
-                },
-            )
+                    "type": "text",
+                    "text": f"sent reply to {reply_to}" + (f" ({sent_id})" if sent_id else ""),
+                }
+            ]
+            if inbox_bundle and inbox_bundle.get("messages"):
+                response_content.append(
+                    {
+                        "type": "text",
+                        "text": _format_inbox_bundle_for_mcp(inbox_bundle),
+                    }
+                )
+            elif inbox_error:
+                response_content.append({"type": "text", "text": f"(inbox poll failed: {inbox_error})"})
+
+            await self.send_response(request_id, {"content": response_content})
             self.log(f"replied to {reply_to}")
         except Exception as exc:  # pragma: no cover - exercised in live runs
             await self.send_response(
@@ -936,6 +1011,52 @@ class ChannelBridge:
                     "isError": True,
                 },
             )
+
+    async def _poll_channel_inbox_after_reply(
+        self,
+        *,
+        wait_seconds: int,
+        limit: int,
+    ) -> dict[str, Any]:
+        """After a channel reply lands, return any unread messages addressed
+        to this agent so the caller doesn't talk past whatever arrived while
+        the reply was being composed.
+
+        Mirrors the wait-loop shape of ``_poll_managed_agent_inbox_after_send``
+        in ``commands/gateway.py``: poll once immediately, then keep polling
+        on ``poll_interval`` until messages arrive or the deadline elapses.
+        Uses the channel's already-authenticated agent client so no extra
+        identity setup is needed.
+        """
+        deadline = time.monotonic() + max(0, int(wait_seconds))
+        capped_limit = max(1, min(int(limit), 100))
+        poll_interval = 1.0
+        while True:
+            data = await asyncio.to_thread(
+                self.client.list_messages,
+                limit=capped_limit,
+                space_id=self.space_id,
+                agent_id=self.agent_id,
+                unread_only=True,
+                mark_read=True,
+                channel="main",
+            )
+            messages = (
+                data if isinstance(data, list) else (data.get("messages") if isinstance(data, dict) else []) or []
+            )
+            unread_count = (
+                data.get("unread_count") if isinstance(data, dict) and "unread_count" in data else len(messages)
+            )
+            bundle: dict[str, Any] = {
+                "agent": self.agent_name,
+                "agent_id": self.agent_id,
+                "space_id": self.space_id,
+                "messages": messages,
+                "unread_count": unread_count,
+            }
+            if messages or wait_seconds <= 0 or time.monotonic() >= deadline:
+                return bundle
+            await asyncio.sleep(poll_interval)
 
     async def handle_request(self, request: dict[str, Any]) -> None:
         request_id = request.get("id")

@@ -350,6 +350,13 @@ class AxClient:
                     "with an explicit reason such as quota, rate limit, name conflict, or feature flag; "
                     "the CLI cannot safely infer the denied create reason from the SPA shell."
                 )
+            elif method == "POST" and path == "/api/v1/messages":
+                detail = (
+                    "Send-message returned HTML instead of JSON. The hosted /api/v1/messages POST route "
+                    "is being captured by the SPA frontend, so reply metadata (parent_id, mentions, "
+                    "attachments) cannot reach the conversation; agent-to-agent reply routing fails on "
+                    "this path until the backend route is restored."
+                )
             else:
                 detail = f"Expected JSON but got HTML from {r.url} — the frontend may be catching this API route"
             raise httpx.HTTPStatusError(

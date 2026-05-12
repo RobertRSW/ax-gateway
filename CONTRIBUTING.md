@@ -1,7 +1,49 @@
-# Contributing
+# Contributing to ax-gateway
 
-Thanks for improving `axctl`. This repository is public-facing, so changes
-should be easy for operators to understand, test, and release.
+Thanks for improving ax-gateway / `axctl`. This repository is public-facing, so
+changes should be easy for operators to understand, test, and release.
+
+## Code of Conduct
+
+This project is governed by our [Code of Conduct](./CODE_OF_CONDUCT.md). By
+participating, you are expected to uphold it. Report unacceptable behavior to
+**support@ax-platform.com**.
+
+## New Here?
+
+If you are joining the project for the first time:
+
+1. Read through this guide and the [Development Setup](#development-setup) section below
+2. Browse **[Good First Issues](https://github.com/ax-platform/ax-gateway/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22)** —
+   small, well-scoped tasks tagged for newcomers
+
+## Getting Started
+
+### Prerequisites
+
+- **Python 3.11+**
+- **Git**
+
+### Fork & Clone
+
+1. Fork this repository on GitHub
+2. Clone your fork:
+   ```bash
+   git clone https://github.com/YOUR_USERNAME/ax-gateway.git
+   cd ax-gateway
+   ```
+3. Add upstream remote:
+   ```bash
+   git remote add upstream https://github.com/ax-platform/ax-gateway.git
+   ```
+
+## Contributor License Agreement (CLA)
+
+Before we can accept your first pull request, you must sign our
+[Contributor License Agreement](CLA.md). This is handled automatically by the
+CLA Assistant bot on GitHub. When you open your first PR, you will receive a
+comment with a link to sign the CLA. You only need to sign once. Without a
+signed CLA, the PR cannot be merged.
 
 ## Development Setup
 
@@ -20,22 +62,22 @@ local development.
 
 ## Branches
 
-- `dev/staging` is the fast integration branch.
-- `main` is the public release branch.
-- Promotion to `main` should happen through a reviewed PR.
+- `main` is the integration and release branch. Branch all new work from `main`.
+- `dev/staging` is dormant as of 2026-05-07 and far behind `main`. Do not branch
+  from it — PRs cut from `dev/staging` will silently revert recent work.
 
 ## Commit Style
 
 Use Conventional Commits so Release Please can generate the changelog and
 version bump correctly:
 
-- `fix:` for compatible bug fixes.
-- `feat:` for user-visible CLI capability.
-- `docs:`, `test:`, `ci:`, `chore:`, and `style:` for non-release metadata.
+- `fix:` for compatible bug fixes
+- `feat:` for user-visible CLI capability
+- `docs:`, `test:`, `ci:`, `chore:`, and `style:` for non-release metadata
 - Use `!` or a `BREAKING CHANGE:` footer only when the operator-facing contract
-  changes incompatibly.
+  changes incompatibly
 
-## Auth And Credentials
+## Security and Credentials
 
 `axctl` handles user PATs, agent PATs, exchanged JWTs, and profile metadata.
 Treat identity boundaries as part of the product contract:
@@ -48,14 +90,35 @@ Treat identity boundaries as part of the product contract:
 - Update tests and docs for any token, profile, JWT, or identity behavior
   change.
 
+## Pull Request Guidelines
+
+Before submitting:
+
+- Code runs without errors
+- `pytest tests/ -v --tb=short` passes
+- `ruff check ax_cli/` and `ruff format --check ax_cli/` pass
+- `python -m build` succeeds
+- No sensitive data committed
+- Branch is up to date with target branch
+
 ## Release Process
 
 See [docs/release-process.md](docs/release-process.md).
 
 The short version:
 
-1. Land work in `dev/staging`.
-2. Promote `dev/staging` to `main`.
+1. Branch off `main` and open a PR.
+2. Merge to `main` after review and CI pass.
 3. Release Please opens a release PR.
 4. Merge the release PR after reviewing the version and changelog.
 5. GitHub Release publication triggers PyPI publishing.
+
+## Community & Support
+
+- **GitHub Issues**: [Report bugs or request features](https://github.com/ax-platform/ax-gateway/issues)
+- **Security Vulnerabilities**: See [SECURITY.md](./SECURITY.md) — do not open a public issue
+
+## License
+
+By contributing to ax-gateway, you agree that your contributions will be
+licensed under the **MIT License**.

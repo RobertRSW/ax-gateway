@@ -268,7 +268,7 @@ Use the dashboard's **Connect agent** flow or the equivalent CLI commands:
 ```bash
 ax gateway agents add demo-hermes --template hermes
 ax gateway agents add gemma4 --template ollama --ollama-model gemma4:latest
-ax gateway agents add echo-bot --template echo
+ax gateway agents add echo-bot --template echo_test
 ax gateway agents add notifications --template service_account
 ```
 
@@ -287,7 +287,7 @@ The main runtime families are:
 | --- | --- | --- |
 | `hermes` | Coding agents with tools, repo access, and session continuity | Long-running supervised listener |
 | `ollama` | Local models such as Gemma or Nemotron | Gateway-managed local bridge with transcript-backed memory |
-| `echo` | Smoke tests and demos | Built-in test runtime |
+| `echo_test` | Smoke tests and demos | Built-in test runtime |
 | `service_account` | Named notification sources, reminders, alerting, and probes | Gateway sender identity, not a live agent |
 | `pass_through` | Codex, Claude Code, scripts, or assistants that check a mailbox | Polling mailbox, approval required |
 | `claude_code_channel` | Attached Claude Code sessions over MCP/channel | Live attached session observed by Gateway |
@@ -367,6 +367,36 @@ After the repo-local `.ax/config.toml` exists, prefer the `--workdir` form or
 run from that directory and omit identity flags. Avoid `--agent` in normal
 agent instructions; Gateway should resolve the registry row from the local
 config and fingerprint.
+
+### Optional: session-continuity challenge
+
+`AX_GATEWAY_SESSION_CHALLENGE=1` on the Gateway daemon enables a Phase-1
+opt-in challenge cycle on the `/local/send` path. This is a session-retention
+test and a guard against accidental identity sharing when several ephemeral
+sessions run from the same workdir — **not default onboarding**, and not a
+substitute for fingerprint-based registry approval.
+
+When enabled, the first send under a session is rejected with a short code
+the agent must echo on the next send via `--session-proof`. Each successful
+send rotates the code and returns the next one in the response payload as
+`next_session_proof`:
+
+```text
+$ AX_GATEWAY_SESSION_CHALLENGE=1 ax gateway start ...
+
+# In the agent's workdir:
+$ ax gateway local send --workdir . "first send"
+Error: session_challenge_required: 4HTQR8U. Re-run with --session-proof <code>
+       to confirm session continuity.
+
+$ ax gateway local send --workdir . "first send" --session-proof 4HTQR8U
+Sent through Gateway as @mac_frontend
+Next session-proof: K2FQEK_E (echo this with --session-proof on the next send)
+```
+
+A wrong proof fails with `invalid_session_proof: expected <code>` so the
+operator can recover by re-running once without `--session-proof` to re-issue
+the challenge. With the env var unset, behavior is unchanged.
 
 ### Space Binding
 

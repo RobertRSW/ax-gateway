@@ -165,6 +165,151 @@ def test_channel_reply_preserves_explicit_mentions_for_routing():
     assert client.sent[0]["metadata"]["mentions"] == ["nemotron"]
 
 
+# --- Inbox bundling on channel reply (aX task 663d9e6f) -------------------
+
+
+class _InboxClient(FakeClient):
+    """FakeClient that also supports list_messages so the inbox poll lands."""
+
+    def __init__(self, *, list_messages_response, **kwargs):
+        super().__init__(**kwargs)
+        self._list_messages_response = list_messages_response
+        self.list_messages_calls: list[dict] = []
+
+    def list_messages(self, *, limit=None, space_id=None, agent_id=None, unread_only=None, mark_read=None, channel=None):
+        self.list_messages_calls.append(
+            {
+                "limit": limit,
+                "space_id": space_id,
+                "agent_id": agent_id,
+                "unread_only": unread_only,
+                "mark_read": mark_read,
+                "channel": channel,
+            }
+        )
+        return self._list_messages_response
+
+
+def _send_response_for(bridge: CaptureBridge) -> dict:
+    """Return the response payload the bridge wrote for the most recent reply."""
+    for payload in reversed(bridge.writes):
+        if isinstance(payload, dict) and payload.get("result") and "content" in payload["result"]:
+            return payload["result"]
+    raise AssertionError("no MCP response written")
+
+
+def test_channel_reply_bundles_unread_inbox_in_response_by_default():
+    """Default ON: a reply should return what arrived while the agent was drafting."""
+    inbox_response = {
+        "messages": [
+            {"id": "m-1", "content": "@peer-agent ping from alex", "agent_name": "alex"},
+            {"id": "m-2", "content": "@peer-agent follow-up", "agent_name": "alex"},
+        ],
+        "unread_count": 2,
+    }
+    client = _InboxClient(list_messages_response=inbox_response)
+    bridge = CaptureBridge(client)
+    bridge._last_message_id = "incoming-123"
+
+    asyncio.run(
+        bridge.handle_tool_call(
+            1,
+            {"name": "reply", "arguments": {"text": "thanks!", "inbox_wait": 0}},
+        )
+    )
+
+    assert client.sent[0]["content"] == "thanks!"
+    assert client.list_messages_calls, "list_messages must run on the post-reply inbox poll"
+    assert client.list_messages_calls[0]["unread_only"] is True
+    assert client.list_messages_calls[0]["mark_read"] is True
+    assert client.list_messages_calls[0]["agent_id"] == "agent-123"
+
+    response = _send_response_for(bridge)
+    assert len(response["content"]) == 2  # send confirmation + inbox bundle
+    inbox_text = response["content"][1]["text"]
+    assert "INBOX while you were drafting" in inbox_text
+    assert "2 unread message(s)" in inbox_text
+    assert "@alex" in inbox_text
+    assert "ping from alex" in inbox_text
+
+
+def test_channel_reply_skips_inbox_when_arg_is_false():
+    """`inbox: false` opts out of the post-reply poll entirely."""
+    client = _InboxClient(list_messages_response={"messages": [], "unread_count": 0})
+    bridge = CaptureBridge(client)
+    bridge._last_message_id = "incoming-123"
+
+    asyncio.run(
+        bridge.handle_tool_call(
+            1,
+            {"name": "reply", "arguments": {"text": "no inbox please", "inbox": False}},
+        )
+    )
+
+    assert not client.list_messages_calls, "inbox=false must skip the post-reply poll"
+    response = _send_response_for(bridge)
+    assert len(response["content"]) == 1  # just the send confirmation, no inbox item
+
+
+def test_channel_reply_omits_inbox_section_when_no_unread():
+    """No unread messages → response stays single-item, not noisy."""
+    client = _InboxClient(list_messages_response={"messages": [], "unread_count": 0})
+    bridge = CaptureBridge(client)
+    bridge._last_message_id = "incoming-123"
+
+    asyncio.run(
+        bridge.handle_tool_call(
+            1,
+            {"name": "reply", "arguments": {"text": "quiet send", "inbox_wait": 0}},
+        )
+    )
+
+    assert client.list_messages_calls, "poll still runs to verify quiet"
+    response = _send_response_for(bridge)
+    assert len(response["content"]) == 1
+
+
+def test_format_inbox_bundle_for_mcp_caps_at_five():
+    """The render helper truncates long inbox lists to keep the MCP item compact."""
+    bundle = {
+        "agent": "peer-agent",
+        "messages": [
+            {"id": f"m-{i}", "content": f"msg {i}", "agent_name": "alex"} for i in range(10)
+        ],
+        "unread_count": 10,
+    }
+    text = channel_mod._format_inbox_bundle_for_mcp(bundle)
+    assert "10 unread message(s)" in text
+    # 5 visible items + 1 "and N more" line.
+    assert text.count("@alex") == 5
+    assert "and 5 more" in text
+
+
+def test_channel_reply_shows_inbox_error_when_poll_fails():
+    """If list_messages raises, the response still ships the send confirmation
+    plus a `(inbox poll failed: ...)` line so the agent knows something missed."""
+
+    class _RaisingClient(FakeClient):
+        def list_messages(self, **_kwargs):
+            raise RuntimeError("upstream 503")
+
+    client = _RaisingClient()
+    bridge = CaptureBridge(client)
+    bridge._last_message_id = "incoming-123"
+
+    asyncio.run(
+        bridge.handle_tool_call(
+            1,
+            {"name": "reply", "arguments": {"text": "even on error", "inbox_wait": 0}},
+        )
+    )
+
+    response = _send_response_for(bridge)
+    assert len(response["content"]) == 2
+    assert "inbox poll failed" in response["content"][1]["text"]
+    assert "upstream 503" in response["content"][1]["text"]
+
+
 def test_channel_can_publish_working_status_on_delivery():
     client = FakeClient("axp_a_AgentKey.Secret")
     bridge = CaptureBridge(client)
@@ -1277,6 +1422,7 @@ def test_channel_setup_uses_gateway_registry_defaults(monkeypatch, tmp_path):
 def test_channel_setup_can_generate_docker_mcp_command(tmp_path):
     token_file = tmp_path / "token"
     token_file.write_text("axp_a_agent.secret\n")
+    env_path = tmp_path / "orion.env"
 
     result = runner.invoke(
         channel_mod.app,
@@ -1293,6 +1439,8 @@ def test_channel_setup_can_generate_docker_mcp_command(tmp_path):
             "docker",
             "--container-image",
             "ax-channel:demo",
+            "--env-path",
+            str(env_path),
             "--json",
         ],
     )
@@ -1304,3 +1452,4 @@ def test_channel_setup_can_generate_docker_mcp_command(tmp_path):
     assert "ax-channel:demo" in server["args"]
     assert "-i" in server["args"]
     assert "axctl" in server["args"]
+    assert env_path.exists()
