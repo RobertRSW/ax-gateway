@@ -58,9 +58,9 @@ Gateway once from a trusted terminal, then Gateway mints agent-scoped
 credentials, supervises runtimes, and gives pass-through agents a mailbox.
 Agents should use their Gateway identity, not the user's bootstrap credential.
 
-Get a user PAT by logging in to [paxai.app](https://paxai.app) going to the wheel icon, selecting **All Settings** and going to the **Credentials** tab.
-This is a high-privilege token. Treat it like a password and paste it only into
-your trusted terminal.
+Create a user PAT with CLI scope by logging in to [paxai.app](https://paxai.app), going to the wheel icon, selecting **All Settings**, and opening the **Credentials** tab.
+This user PAT is a high-privilege bootstrap token. Treat it like a password and
+paste it only into your trusted terminal.
 
 ```bash
 # 1. Store the user bootstrap session in Gateway.

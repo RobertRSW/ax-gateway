@@ -45,10 +45,12 @@ def _resolve_login_token(token: str | None) -> str:
     if token and token.strip():
         return token.strip()
 
-    console.print("[cyan]Paste your aX token. Input is hidden.[/cyan]")
+    console.print("[cyan]Paste your aX user PAT (axp_u_). Input is hidden.[/cyan]")
     entered = typer.prompt("Token", hide_input=True).strip()
     if not entered:
-        console.print("[red]Token required.[/red] Get one from Settings > Credentials in the UI.")
+        console.print(
+            "[red]Token required.[/red] Create a user PAT with CLI scope from Settings > Credentials in the UI."
+        )
         raise typer.Exit(1)
     console.print(f"[green]Token captured:[/green] {_mask_token_prefix(entered)}")
     return entered

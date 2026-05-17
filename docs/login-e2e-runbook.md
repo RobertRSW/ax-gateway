@@ -46,7 +46,7 @@ axdev login --url https://paxai.app
 Expected:
 
 ```text
-Paste your aX token. Input is hidden.
+Paste your aX user PAT (axp_u_). Input is hidden.
 Token:
 Token captured: axp_u_********
 

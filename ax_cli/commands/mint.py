@@ -142,7 +142,7 @@ def mint(
     if token.startswith("axp_a_"):
         console.print("[red]Cannot mint with an agent PAT.[/red]")
         console.print("You need a user PAT (axp_u_...) to create agent tokens.")
-        console.print("[dim]A user PAT can be created at Settings > Credentials on the platform.[/dim]")
+        console.print("[dim]A user PAT with CLI scope can be created at Settings > Credentials on the platform.[/dim]")
         raise typer.Exit(1)
 
     if not token.startswith("axp_u_"):

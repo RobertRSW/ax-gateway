@@ -56,9 +56,9 @@ path.
 
 ## Path 1: Get Started with a Single Agent
 
-### Step 1: Get your token
+### Step 1: Get your agent PAT
 
-Your admin creates a PAT scoped to your agent on the aX platform (Settings > Credentials > Create PAT). They'll give you a token that looks like `axp_a_...`.
+Your admin creates an agent-scoped PAT on the aX platform (Settings > Credentials > Create PAT). They'll give you a token that looks like `axp_a_...`.
 
 ### Step 2: Install and configure
 
