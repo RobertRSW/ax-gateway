@@ -4241,6 +4241,37 @@ def _compose_agent_system_prompt(entry: dict[str, Any]) -> str | None:
     return "\n\n".join(parts) if parts else None
 
 
+# SDK runtimes that the vendored Hermes sentinel can drive via `--runtime`.
+# Distinct from `_sentinel_runtime_name` (which handles the CLI-style claude/codex
+# backends). Operators can set this on a managed-agent entry as
+# `sentinel_sdk_runtime`, `hermes_runtime`, or `sdk_runtime`. Default is
+# `hermes_sdk`, matching the historical hardcoded value.
+_HERMES_SENTINEL_SDK_RUNTIMES = {
+    "hermes_sdk",
+    "openai_sdk",
+    "groq_sdk",
+    "gemini_sdk",
+}
+
+
+def _hermes_sentinel_sdk_runtime(entry: dict[str, Any]) -> str:
+    """Resolve which SDK runtime the vendored sentinel.py should use.
+
+    Reads (in priority order): `sentinel_sdk_runtime`, `hermes_runtime`,
+    `sdk_runtime`. Falls back to `hermes_sdk` (the historical default that
+    the launcher hardcoded before this knob existed). Unknown values fall
+    back to the default so a typo can't crash agent start.
+    """
+    configured = (
+        str(entry.get("sentinel_sdk_runtime") or entry.get("hermes_runtime") or entry.get("sdk_runtime") or "")
+        .strip()
+        .lower()
+    )
+    if configured in _HERMES_SENTINEL_SDK_RUNTIMES:
+        return configured
+    return "hermes_sdk"
+
+
 def _build_hermes_sentinel_cmd(entry: dict[str, Any]) -> list[str]:
     timeout = str(entry.get("timeout_seconds") or entry.get("timeout") or 600)
     update_interval = str(entry.get("update_interval") or 2.0)
@@ -4257,7 +4288,7 @@ def _build_hermes_sentinel_cmd(entry: dict[str, Any]) -> list[str]:
         "--update-interval",
         update_interval,
         "--runtime",
-        "hermes_sdk",
+        _hermes_sentinel_sdk_runtime(entry),
         "--model",
         _hermes_sentinel_model(entry),
     ]
