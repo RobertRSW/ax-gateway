@@ -81,11 +81,11 @@ def parse_args():
     parser.add_argument("--system-prompt", type=str, default=None,
                         help="Additional system prompt")
     parser.add_argument("--runtime",
-                        choices=["claude", "codex", "claude_cli", "codex_cli", "openai_sdk", "hermes_sdk", "groq_sdk", "mistral_sdk", "gemini_sdk"],
+                        choices=["claude", "codex", "claude_cli", "codex_cli", "openai_sdk", "hermes_sdk", "groq_sdk", "mistral_sdk", "gemini_sdk", "leapfrog_sdk"],
                         default="claude",
                         help="Runtime plugin: claude/claude_cli (subprocess), "
                              "codex/codex_cli (subprocess), openai_sdk (SDK), "
-                             "groq_sdk (SDK), mistral_sdk (SDK), gemini_sdk (SDK)")
+                             "groq_sdk (SDK), mistral_sdk (SDK), gemini_sdk (SDK), leapfrog_sdk (SDK)")
     parser.add_argument("--disable-codex-mcp", action="store_true",
                         help="Disable inherited Codex MCP servers for listener runs")
     return parser.parse_args()
@@ -945,7 +945,7 @@ def run_cli(message: str, workdir: str, args, api: AxAPI,
         runtime_name = "codex_cli"
 
     # Check if this is a plugin runtime (not the legacy subprocess path)
-    if runtime_name in ("claude_cli", "codex_cli", "openai_sdk", "hermes_sdk", "groq_sdk", "mistral_sdk", "gemini_sdk"):
+    if runtime_name in ("claude_cli", "codex_cli", "openai_sdk", "hermes_sdk", "groq_sdk", "mistral_sdk", "gemini_sdk", "leapfrog_sdk"):
         return _run_via_runtime_plugin(
             runtime_name, message, workdir, args, api,
             parent_id, space_id, sessions, histories, thread_id=thread_id,
