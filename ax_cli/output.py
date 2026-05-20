@@ -74,19 +74,34 @@ def print_kv(data: dict):
 def handle_error(e: httpx.HTTPStatusError):
     url = str(e.request.url) if e.request else "unknown"
     invalid_credential = False
-    try:
-        body = e.response.json()
-        detail = body.get("detail", e.response.text[:200])
-        if isinstance(detail, dict) and detail.get("error") == "invalid_credential":
-            invalid_credential = True
-    except Exception:
-        body = e.response.text[:200]
-        if "<html" in body.lower():
-            detail = "Got HTML instead of JSON (frontend may be catching this route)"
-        else:
-            detail = body
-            if "invalid_credential" in body.lower():
+    body_text = e.response.text or ""
+    body_is_html = "<html" in body_text.lower()[:200]
+
+    # When the response is HTML AND the exception itself carries a CLI-authored
+    # detail (e.g. from client._parse_json's route-aware HTML-detection paths
+    # in client.py:_parse_json), prefer the author's message — it's route-aware
+    # and operator-actionable in ways the body isn't. httpx.Response
+    # .raise_for_status() messages always include "For more information check:";
+    # CLI-authored messages don't. See #57.
+    exc_message = str(e).strip()
+    cli_authored = bool(exc_message) and "For more information check:" not in exc_message
+
+    if body_is_html and cli_authored:
+        detail = exc_message
+    else:
+        try:
+            body = e.response.json()
+            detail = body.get("detail", body_text[:200])
+            if isinstance(detail, dict) and detail.get("error") == "invalid_credential":
                 invalid_credential = True
+        except Exception:
+            body = body_text[:200]
+            if body_is_html:
+                detail = "Got HTML instead of JSON (frontend may be catching this route)"
+            else:
+                detail = body
+                if "invalid_credential" in body.lower():
+                    invalid_credential = True
     typer.echo(_redact_secrets(f"Error {e.response.status_code}: {detail}"), err=True)
     typer.echo(_redact_secrets(f"  URL: {url}"), err=True)
     if invalid_credential:

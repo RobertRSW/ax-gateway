@@ -77,6 +77,93 @@ def test_handle_error_html_response():
         handle_error(err)
 
 
+# ---------- #57: handle_error must preserve _parse_json's CLI-authored detail ----------
+#
+# Two paths can raise httpx.HTTPStatusError:
+#   1. response.raise_for_status() — httpx builds the message and always
+#      includes the substring "For more information check:".
+#   2. client._parse_json (or any caller) raises directly with a route-aware
+#      message — no such substring.
+#
+# handle_error must distinguish the two when the body is HTML: for (2), surface
+# the author's detail; for (1), use the existing generic body-derived message.
+
+
+_PARSE_JSON_DETAIL = (
+    "Agent create returned HTML instead of JSON. The hosted API must return a "
+    "JSON 4xx with an explicit reason such as quota, rate limit, name conflict, "
+    "or feature flag; the CLI cannot safely infer the denied create reason from "
+    "the SPA shell."
+)
+
+
+def test_handle_error_surfaces_cli_authored_detail_for_html_response(capsys):
+    """Regression for #57: when _parse_json raises with a route-aware detail
+    and the body is the SPA shell, handle_error must print that detail rather
+    than the generic 'Got HTML instead of JSON' fallback."""
+    request = httpx.Request("POST", "https://paxai.app/api/v1/agents")
+    response = MagicMock(spec=httpx.Response)
+    response.status_code = 200
+    response.text = "<!DOCTYPE html><html><head><title>aX Platform</title></head></html>"
+    response.json.side_effect = Exception("not json")
+    err = httpx.HTTPStatusError(_PARSE_JSON_DETAIL, request=request, response=response)
+
+    with pytest.raises(typer.Exit):
+        handle_error(err)
+
+    stderr = capsys.readouterr().err
+    assert "Agent create returned HTML instead of JSON" in stderr
+    assert "cannot safely infer the denied create reason" in stderr
+    assert "Got HTML instead of JSON (frontend may be catching this route)" not in stderr
+
+
+def test_handle_error_uses_generic_message_for_raise_for_status_with_html(capsys):
+    """Sibling guard for #57: when httpx.Response.raise_for_status() raised the
+    exception (its message always includes 'For more information check:'),
+    handle_error must NOT mistake the boilerplate message for a CLI-authored
+    detail. The generic 'Got HTML instead of JSON' fallback should still fire."""
+    request = httpx.Request("GET", "https://paxai.app/api/v1/something")
+    response = MagicMock(spec=httpx.Response)
+    response.status_code = 502
+    response.text = "<html><body>Bad Gateway</body></html>"
+    response.json.side_effect = Exception("not json")
+    # Mimics the exact shape httpx generates in raise_for_status — the
+    # discriminator handle_error keys off is "For more information check:".
+    raise_for_status_message = (
+        "Server error '502 Bad Gateway' for url 'https://paxai.app/api/v1/something'\n"
+        "For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/502"
+    )
+    err = httpx.HTTPStatusError(raise_for_status_message, request=request, response=response)
+
+    with pytest.raises(typer.Exit):
+        handle_error(err)
+
+    stderr = capsys.readouterr().err
+    assert "Got HTML instead of JSON (frontend may be catching this route)" in stderr
+    assert "For more information check:" not in stderr
+
+
+def test_handle_error_cli_authored_detail_with_non_html_body_uses_body(capsys):
+    """The CLI-authored-detail preference is gated on the body being HTML.
+    If the body is JSON or plain text, the existing parsing flow stays in
+    charge — we should not start preferring exception strings over real
+    server error bodies for the unrelated common case."""
+    err = _make_http_status_error(
+        409,
+        response_json={"detail": "Agent with that name already exists in this space."},
+    )
+    # Override the exception message to something CLI-authored-looking, to
+    # prove that the body-is-JSON path still wins.
+    err.args = ("placeholder cli message that should NOT appear",)
+
+    with pytest.raises(typer.Exit):
+        handle_error(err)
+
+    stderr = capsys.readouterr().err
+    assert "Agent with that name already exists" in stderr
+    assert "placeholder cli message that should NOT appear" not in stderr
+
+
 def test_handle_error_plain_text_response():
     err = _make_http_status_error(
         500,
