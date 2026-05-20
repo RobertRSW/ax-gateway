@@ -4,7 +4,14 @@ Public API re-exports for convenience.
 """
 
 from .auth import auth_status, cleanup_auth, read_auth, write_auth
-from .errors import ConnectorAuthError, ConnectorNotFoundError, ConnectorProviderError
+from .errors import (
+    ConnectorAuthError,
+    ConnectorAuthHTTPError,
+    ConnectorNotFoundError,
+    ConnectorProviderError,
+    ConnectorRateLimitError,
+    ConnectorTransientError,
+)
 from .providers.dispatch import execute_tool, search_tools
 from .storage import (
     add_connector,
@@ -21,8 +28,11 @@ from .validation import validate_new_connector
 
 __all__ = [
     "ConnectorAuthError",
+    "ConnectorAuthHTTPError",
     "ConnectorNotFoundError",
     "ConnectorProviderError",
+    "ConnectorRateLimitError",
+    "ConnectorTransientError",
     "ConnectorRow",
     "add_connector",
     "auth_status",

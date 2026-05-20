@@ -6,6 +6,7 @@ with 0o600 permissions. Values are stored as ``KEY=VALUE`` lines.
 
 from __future__ import annotations
 
+import logging
 import os
 import tempfile
 from datetime import datetime, timezone
@@ -13,6 +14,8 @@ from pathlib import Path
 from typing import Any
 
 from .errors import ConnectorAuthError
+
+log = logging.getLogger("connectors.auth")
 
 
 def _auth_dir() -> Path:
@@ -32,23 +35,26 @@ def _auth_path(connector_id: str) -> Path:
 
 
 def _serialize_env(kvs: dict[str, str]) -> str:
-    lines: list[str] = []
+    if not kvs:
+        return ""
+    lines: list[str] = ["# managed by ax gateway — do not source as shell"]
     for key, value in sorted(kvs.items()):
         if "=" in key or "\n" in key:
             raise ConnectorAuthError(key, "Key must not contain '=' or newlines")
         if "\n" in value:
             raise ConnectorAuthError(key, "Value must not contain newlines")
         lines.append(f"{key}={value}")
-    return "\n".join(lines) + "\n" if lines else ""
+    return "\n".join(lines) + "\n"
 
 
 def _parse_env(text: str) -> dict[str, str]:
     result: dict[str, str] = {}
-    for line in text.splitlines():
+    for lineno, line in enumerate(text.splitlines(), 1):
         line = line.strip()
         if not line or line.startswith("#"):
             continue
         if "=" not in line:
+            log.warning("auth env line %d: skipping malformed line (no '=')", lineno)
             continue
         key, _, value = line.partition("=")
         key = key.strip()

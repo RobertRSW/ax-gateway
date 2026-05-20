@@ -46,3 +46,33 @@ class ConnectorProviderError(ConnectorError):
         if request_id:
             parts.append(f" [request_id={request_id}]")
         super().__init__("".join(parts))
+
+
+class ConnectorAuthHTTPError(ConnectorProviderError):
+    """HTTP 401/403 from the provider — bad or expired credentials."""
+
+
+class ConnectorRateLimitError(ConnectorProviderError):
+    """HTTP 429 from the provider — caller should back off and retry."""
+
+
+class ConnectorTransientError(ConnectorProviderError):
+    """HTTP 500/502/503/504 from the provider — transient, may succeed on retry."""
+
+
+def classify_provider_error(
+    provider: str,
+    detail: str,
+    *,
+    status_code: int | None = None,
+    request_id: str | None = None,
+) -> ConnectorProviderError:
+    """Return the most specific exception subclass for the given status code."""
+    kwargs = {"status_code": status_code, "request_id": request_id}
+    if status_code in (401, 403):
+        return ConnectorAuthHTTPError(provider, detail, **kwargs)
+    if status_code == 429:
+        return ConnectorRateLimitError(provider, detail, **kwargs)
+    if status_code is not None and status_code >= 500:
+        return ConnectorTransientError(provider, detail, **kwargs)
+    return ConnectorProviderError(provider, detail, **kwargs)

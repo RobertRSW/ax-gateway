@@ -2,11 +2,23 @@
 
 from __future__ import annotations
 
+from types import ModuleType
 from typing import Any
 
 from ..errors import ConnectorProviderError
 from ..types import ConnectorRow
 from . import composio_adapter
+
+_ADAPTERS: dict[str, ModuleType] = {
+    "composio": composio_adapter,
+}
+
+
+def _get_adapter(provider: str) -> ModuleType:
+    adapter = _ADAPTERS.get(provider)
+    if adapter is None:
+        raise ConnectorProviderError(provider, f"No adapter for provider {provider!r}")
+    return adapter
 
 
 def execute_tool(
@@ -15,15 +27,14 @@ def execute_tool(
     args: dict[str, Any],
     auth_env: dict[str, str],
 ) -> dict[str, Any]:
-    if connector.provider == "composio":
-        return composio_adapter.execute_tool(
-            tool_slug,
-            args,
-            auth_env,
-            connector.config,
-            connector.name,
-        )
-    raise ConnectorProviderError(connector.provider, f"No adapter for provider {connector.provider!r}")
+    adapter = _get_adapter(connector.provider)
+    return adapter.execute_tool(
+        tool_slug,
+        args,
+        auth_env,
+        connector.config,
+        connector.name,
+    )
 
 
 def search_tools(
@@ -33,12 +44,11 @@ def search_tools(
     *,
     limit: int = 10,
 ) -> dict[str, Any]:
-    if connector.provider == "composio":
-        return composio_adapter.search_tools(
-            query,
-            auth_env,
-            connector.config,
-            connector.name,
-            limit=limit,
-        )
-    raise ConnectorProviderError(connector.provider, f"No search adapter for provider {connector.provider!r}")
+    adapter = _get_adapter(connector.provider)
+    return adapter.search_tools(
+        query,
+        auth_env,
+        connector.config,
+        connector.name,
+        limit=limit,
+    )

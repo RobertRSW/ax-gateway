@@ -2757,19 +2757,22 @@ def _status_payload(*, activity_limit: int = 10, include_hidden: bool = False) -
     from ..connectors.storage import connectors_registry_path
     from ..connectors.storage import list_connectors as _list_connectors
 
+    _connectors_count = 0
+    _enabled_connectors = 0
+    _connectors_error: str | None = None
     try:
         _all_connectors = _list_connectors()
         _connectors_count = len(_all_connectors)
         _enabled_connectors = sum(1 for c in _all_connectors if c.enabled)
-    except Exception:
-        _connectors_count = 0
-        _enabled_connectors = 0
+    except (json.JSONDecodeError, OSError) as exc:
+        _connectors_error = str(exc)
 
     payload = {
         "gateway_dir": str(gateway_dir()),
         "connectors_registry_path": str(connectors_registry_path()),
         "connectors_count": _connectors_count,
         "enabled_connectors": _enabled_connectors,
+        "connectors_error": _connectors_error,
         "gateway_environment": gateway_environment(),
         "connected": bool(session),
         "base_url": session.get("base_url") if session else None,
@@ -9199,6 +9202,7 @@ def connectors_call(
     ref: str = typer.Argument(..., help="Connector name or ID"),
     tool: str = typer.Option(..., "--tool", "-t", help="Tool slug (e.g. GITHUB_LIST_PRS)"),
     args_json: str = typer.Option("{}", "--args-json", "-a", help="Tool arguments as JSON string"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Show request payload without executing"),
     as_json: bool = JSON_OPTION,
 ):
     """Execute a tool via a connector's provider."""
@@ -9231,6 +9235,20 @@ def connectors_call(
     except ConnectorAuthError as e:
         err_console.print(f"[red]Auth error:[/red] {e}")
         raise typer.Exit(1)
+    if dry_run:
+        payload = {
+            "connector": row.name,
+            "provider": row.provider,
+            "tool": tool,
+            "args": args,
+            "auth_keys": sorted(auth_env.keys()),
+        }
+        if as_json:
+            print_json(payload)
+        else:
+            err_console.print("[bold]Dry run — would send:[/bold]")
+            print_json(payload)
+        return
     try:
         result = execute_tool(row, tool, args, auth_env)
     except ConnectorProviderError as e:

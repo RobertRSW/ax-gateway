@@ -11,7 +11,7 @@ from typing import Any
 
 import httpx
 
-from ..errors import ConnectorAuthError, ConnectorProviderError
+from ..errors import ConnectorAuthError, ConnectorProviderError, classify_provider_error
 
 log = logging.getLogger("connectors.composio")
 
@@ -47,15 +47,26 @@ def _headers(api_key: str) -> dict[str, str]:
 def _handle_error_response(resp: httpx.Response, context: str) -> None:
     if resp.is_success:
         return
-    try:
-        body = resp.json()
-    except Exception:
-        body = {}
-    detail = str(body.get("error") or body.get("message") or resp.text[:200])
-    request_id = body.get("requestId")
-    raise ConnectorProviderError(
+    content_type = resp.headers.get("content-type", "")
+    is_json = "application/json" in content_type
+    body: dict[str, str] = {}
+    if is_json:
+        try:
+            body = resp.json()
+        except Exception:
+            pass
+    if not body:
+        text = resp.text[:200].strip()
+        if "<html" in text.lower() or "<!doctype" in text.lower():
+            detail = f"{context}: received HTML instead of JSON (CDN/proxy intercept?)"
+        else:
+            detail = f"{context}: {text}" if text else f"{context}: empty response"
+    else:
+        detail = f"{context}: {body.get('error') or body.get('message') or str(body)}"
+    request_id = body.get("requestId") if body else None
+    raise classify_provider_error(
         "composio",
-        f"{context}: {detail}",
+        detail,
         status_code=resp.status_code,
         request_id=request_id,
     )
