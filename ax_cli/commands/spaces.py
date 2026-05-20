@@ -79,10 +79,15 @@ def list_spaces(
     if as_json:
         print_json(spaces)
     else:
+        # Columns match the keys the API actually returns in list_spaces. The
+        # previous `Visibility` column rendered blank because the response has
+        # no `visibility` field (#50); `slug` is the disambiguator for
+        # same-name spaces and pairs with the fail-closed ambiguity error
+        # from #47/#48 (#49).
         print_table(
-            ["ID", "Name", "Visibility", "Members"],
+            ["ID", "Name", "Slug", "Members"],
             spaces,
-            keys=["id", "name", "visibility", "member_count"],
+            keys=["id", "name", "slug", "member_count"],
         )
 
 
@@ -174,8 +179,12 @@ def members(
     if as_json:
         print_json(members_list)
     else:
+        # API returns each member as {id, display_name, type, role, status, ...}.
+        # The previous keys=["username", ...] rendered blank because no
+        # `username` field exists in the response (#55). `type` is surfaced
+        # so operators can distinguish human members from agent members.
         print_table(
-            ["User", "Role"],
+            ["Member", "Type", "Role"],
             members_list,
-            keys=["username", "role"],
+            keys=["display_name", "type", "role"],
         )

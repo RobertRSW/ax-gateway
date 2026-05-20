@@ -154,7 +154,7 @@ def test_list_spaces_json_via_gateway(monkeypatch):
     )
     monkeypatch.setattr(
         "ax_cli.commands.messages._gateway_local_call",
-        lambda gateway_cfg, method: [{"id": "s1", "name": "Space1", "visibility": "public", "member_count": 5}],
+        lambda gateway_cfg, method: [{"id": "s1", "name": "Space1", "slug": "space-1", "member_count": 5}],
     )
     result = runner.invoke(app, ["spaces", "list", "--json"])
     assert result.exit_code == 0, result.output
@@ -167,12 +167,51 @@ def test_list_spaces_text_via_client(monkeypatch):
     monkeypatch.setattr("ax_cli.commands.spaces.resolve_gateway_config", lambda: {})
 
     client = MagicMock()
-    client.list_spaces.return_value = [{"id": "s1", "name": "Space1", "visibility": "private", "member_count": 2}]
+    client.list_spaces.return_value = [{"id": "s1", "name": "Space1", "slug": "space-1", "member_count": 2}]
     monkeypatch.setattr("ax_cli.commands.spaces.get_client", lambda: client)
 
     result = runner.invoke(app, ["spaces", "list"])
     assert result.exit_code == 0, result.output
     assert "Space1" in result.output
+
+
+def test_list_spaces_text_table_columns(monkeypatch):
+    """Regression for #49/#50: default table must include the Slug column
+    (sole disambiguator for same-name spaces) and must NOT include a
+    Visibility column the API doesn't populate."""
+    monkeypatch.setattr("ax_cli.commands.spaces.resolve_gateway_config", lambda: {})
+
+    client = MagicMock()
+    client.list_spaces.return_value = [
+        {"id": "s1", "name": "Space1", "slug": "space-1", "member_count": 2},
+    ]
+    monkeypatch.setattr("ax_cli.commands.spaces.get_client", lambda: client)
+
+    result = runner.invoke(app, ["spaces", "list"])
+    assert result.exit_code == 0, result.output
+    assert "Slug" in result.output
+    assert "space-1" in result.output
+    assert "Visibility" not in result.output
+
+
+def test_list_spaces_text_disambiguates_same_name(monkeypatch):
+    """Regression for #49: when two spaces share a name, the slug column
+    is the only visible disambiguator in the default table — without it,
+    an operator hitting the #47/#48 ambiguity error can't see which slug
+    is which."""
+    monkeypatch.setattr("ax_cli.commands.spaces.resolve_gateway_config", lambda: {})
+
+    client = MagicMock()
+    client.list_spaces.return_value = [
+        {"id": "11111111-1111-1111-1111-111111111111", "name": "Demo Team", "slug": "demo-team-1", "member_count": 1},
+        {"id": "22222222-2222-2222-2222-222222222222", "name": "Demo Team", "slug": "demo-team-2", "member_count": 1},
+    ]
+    monkeypatch.setattr("ax_cli.commands.spaces.get_client", lambda: client)
+
+    result = runner.invoke(app, ["spaces", "list"])
+    assert result.exit_code == 0, result.output
+    assert "demo-team-1" in result.output
+    assert "demo-team-2" in result.output
 
 
 def test_list_spaces_unwraps_dict_response(monkeypatch):
@@ -269,8 +308,8 @@ def test_get_space_text(monkeypatch):
 def test_members_json(monkeypatch):
     client = MagicMock()
     client.list_space_members.return_value = [
-        {"username": "alice", "role": "admin"},
-        {"username": "bob", "role": "member"},
+        {"id": "u1", "display_name": "alice", "type": "human", "role": "admin"},
+        {"id": "u2", "display_name": "bob", "type": "human", "role": "member"},
     ]
     monkeypatch.setattr("ax_cli.commands.spaces.get_client", lambda: client)
     monkeypatch.setattr("ax_cli.commands.spaces.resolve_space_id", lambda c, **kw: "sid")
@@ -279,24 +318,28 @@ def test_members_json(monkeypatch):
     assert result.exit_code == 0, result.output
     data = json.loads(result.output)
     assert len(data) == 2
-    assert data[0]["username"] == "alice"
+    assert data[0]["display_name"] == "alice"
 
 
 def test_members_text(monkeypatch):
     client = MagicMock()
-    client.list_space_members.return_value = {"members": [{"username": "carol", "role": "viewer"}]}
+    client.list_space_members.return_value = {
+        "members": [{"id": "u3", "display_name": "carol", "type": "human", "role": "viewer"}]
+    }
     monkeypatch.setattr("ax_cli.commands.spaces.get_client", lambda: client)
     monkeypatch.setattr("ax_cli.commands.spaces.resolve_space_id", lambda c, **kw: "sid")
 
     result = runner.invoke(app, ["spaces", "members", "--json"])
     assert result.exit_code == 0, result.output
     data = json.loads(result.output)
-    assert data[0]["username"] == "carol"
+    assert data[0]["display_name"] == "carol"
 
 
 def test_members_with_explicit_space_id(monkeypatch):
     client = MagicMock()
-    client.list_space_members.return_value = [{"username": "dave", "role": "admin"}]
+    client.list_space_members.return_value = [
+        {"id": "u4", "display_name": "dave", "type": "human", "role": "admin"}
+    ]
     monkeypatch.setattr("ax_cli.commands.spaces.get_client", lambda: client)
 
     result = runner.invoke(app, ["spaces", "members", "explicit-sid", "--json"])
@@ -305,16 +348,44 @@ def test_members_with_explicit_space_id(monkeypatch):
 
 
 def test_members_text_table(monkeypatch):
+    """Regression for #55: the Member column must render display_name, not
+    the obsolete username key. Header must be 'Member' (not 'User') because
+    rows include both humans and agents."""
     client = MagicMock()
     client.list_space_members.return_value = [
-        {"username": "eve", "role": "member"},
+        {"id": "u5", "display_name": "eve", "type": "human", "role": "member"},
+        {"id": "a1", "display_name": "aX", "type": "agent", "role": "member"},
     ]
     monkeypatch.setattr("ax_cli.commands.spaces.get_client", lambda: client)
     monkeypatch.setattr("ax_cli.commands.spaces.resolve_space_id", lambda c, **kw: "sid")
 
     result = runner.invoke(app, ["spaces", "members"])
     assert result.exit_code == 0, result.output
+    assert "Member" in result.output
+    assert "Type" in result.output
     assert "eve" in result.output
+    assert "aX" in result.output
+    assert "human" in result.output
+    assert "agent" in result.output
+    # The pre-fix CLI used header "User"; assert we've moved past it so a
+    # future revert is loud.
+    assert "User " not in result.output
+
+
+def test_members_text_table_does_not_use_obsolete_username_key(monkeypatch):
+    """Regression for #55: a mock that only supplies the obsolete `username`
+    key (no `display_name`) must NOT show that value in the output. This is
+    the literal pre-fix shape — confirms we no longer accidentally render it."""
+    client = MagicMock()
+    client.list_space_members.return_value = [
+        {"username": "should-not-render", "role": "admin"},
+    ]
+    monkeypatch.setattr("ax_cli.commands.spaces.get_client", lambda: client)
+    monkeypatch.setattr("ax_cli.commands.spaces.resolve_space_id", lambda c, **kw: "sid")
+
+    result = runner.invoke(app, ["spaces", "members"])
+    assert result.exit_code == 0, result.output
+    assert "should-not-render" not in result.output
 
 
 # ---------- use_space text output ----------
