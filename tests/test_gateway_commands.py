@@ -7281,7 +7281,7 @@ def test_runtime_start_proceeds_after_setup_error_backoff_expires(monkeypatch, t
 
     # last_runtime_error_at older than the backoff window.
     long_ago = (
-        datetime.now(timezone.utc) - timedelta(seconds=gateway_core.SETUP_ERROR_BACKOFF_SECONDS + 60)
+        datetime.now(timezone.utc) - timedelta(seconds=gateway_core.SETUP_ERROR_BACKOFF_SCHEDULE[0] + 60)
     ).isoformat()
 
     runtime = gateway_core.ManagedAgentRuntime(
@@ -7691,6 +7691,327 @@ def test_gateway_spaces_list_command_renders_table(monkeypatch, tmp_path):
     payload = json.loads(result.output)
     assert payload["active_space_id"] == _GOOD_SPACE_UUID
     assert payload["spaces"][0]["id"] == _GOOD_SPACE_UUID
+
+
+# ---------------------------------------------------------------------------
+# Retry-storm circuit breaker (issue #175)
+# ---------------------------------------------------------------------------
+
+
+def test_setup_error_backoff_escalates(monkeypatch, tmp_path):
+    """Backoff must use the escalating schedule, not a flat 30s.
+    A runtime with 3 consecutive errors should wait 120s, not 30s."""
+    _isolate_gateway_paths(monkeypatch, tmp_path)
+    token_file = tmp_path / "token-missing"
+
+    error_at = (datetime.now(timezone.utc) - timedelta(seconds=35)).isoformat()
+
+    runtime = gateway_core.ManagedAgentRuntime(
+        {
+            "name": "escalate-hermes",
+            "agent_id": "agent-esc",
+            "space_id": "space-1",
+            "base_url": "https://paxai.app",
+            "runtime_type": "hermes_sentinel",
+            "token_file": str(token_file),
+            "last_runtime_error_at": error_at,
+            "consecutive_setup_errors": 3,
+        },
+        client_factory=lambda **kwargs: object(),
+    )
+
+    before = gateway_core.load_recent_gateway_activity()
+    runtime.start()
+    after = gateway_core.load_recent_gateway_activity()
+    assert len(after) == len(before), (
+        "runtime.start() should still be in backoff (schedule[2]=120s) but it fired — escalation failed"
+    )
+
+
+def test_setup_error_backoff_clamps_at_schedule_max(monkeypatch, tmp_path):
+    """Consecutive errors beyond the schedule length clamp to the last entry."""
+    _isolate_gateway_paths(monkeypatch, tmp_path)
+    token_file = tmp_path / "token-missing"
+
+    max_backoff = gateway_core.SETUP_ERROR_BACKOFF_SCHEDULE[-1]
+    error_at = (datetime.now(timezone.utc) - timedelta(seconds=max_backoff - 10)).isoformat()
+
+    runtime = gateway_core.ManagedAgentRuntime(
+        {
+            "name": "clamp-hermes",
+            "agent_id": "agent-clamp",
+            "space_id": "space-1",
+            "base_url": "https://paxai.app",
+            "runtime_type": "hermes_sentinel",
+            "token_file": str(token_file),
+            "last_runtime_error_at": error_at,
+            "consecutive_setup_errors": 100,
+        },
+        client_factory=lambda **kwargs: object(),
+    )
+
+    before = gateway_core.load_recent_gateway_activity()
+    runtime.start()
+    after = gateway_core.load_recent_gateway_activity()
+    assert len(after) == len(before), (
+        f"runtime.start() should still be in backoff (clamped to last schedule entry {max_backoff}s) but it fired"
+    )
+
+
+def test_auto_disable_after_max_consecutive_errors(monkeypatch, tmp_path):
+    """After SETUP_ERROR_MAX_CONSECUTIVE identical errors, the agent is
+    auto-disabled with setup_disabled=True and a runtime_auto_disabled event."""
+    _isolate_gateway_paths(monkeypatch, tmp_path)
+    token_file = tmp_path / "token-missing"
+
+    long_ago = (
+        datetime.now(timezone.utc) - timedelta(seconds=gateway_core.SETUP_ERROR_BACKOFF_SCHEDULE[-1] + 60)
+    ).isoformat()
+
+    runtime = gateway_core.ManagedAgentRuntime(
+        {
+            "name": "disable-hermes",
+            "agent_id": "agent-dis",
+            "space_id": "space-1",
+            "base_url": "https://paxai.app",
+            "runtime_type": "hermes_sentinel",
+            "token_file": str(token_file),
+            "last_runtime_error_at": long_ago,
+            "consecutive_setup_errors": gateway_core.SETUP_ERROR_MAX_CONSECUTIVE - 1,
+            "last_setup_error_signature": f"Gateway-managed token file is missing: {token_file}"[:120],
+        },
+        client_factory=lambda **kwargs: object(),
+    )
+
+    runtime.start()
+    assert runtime.entry.get("setup_disabled") is True
+    assert runtime.entry.get("setup_disabled_at") is not None
+    assert "Auto-disabled" in str(runtime.entry.get("setup_disabled_reason") or "")
+    activity = gateway_core.load_recent_gateway_activity()
+    auto_disabled = [e for e in activity if e.get("event") == "runtime_auto_disabled"]
+    assert len(auto_disabled) >= 1
+
+
+def test_disabled_runtime_start_is_noop(monkeypatch, tmp_path):
+    """A setup_disabled runtime must not attempt any work on start()."""
+    _isolate_gateway_paths(monkeypatch, tmp_path)
+
+    runtime = gateway_core.ManagedAgentRuntime(
+        {
+            "name": "noop-hermes",
+            "agent_id": "agent-noop",
+            "space_id": "space-1",
+            "base_url": "https://paxai.app",
+            "runtime_type": "hermes_sentinel",
+            "token_file": str(tmp_path / "tok"),
+            "setup_disabled": True,
+        },
+        client_factory=lambda **kwargs: object(),
+    )
+
+    before = gateway_core.load_recent_gateway_activity()
+    runtime.start()
+    after = gateway_core.load_recent_gateway_activity()
+    assert len(after) == len(before), "disabled runtime should not emit any activity"
+    assert runtime._state.get("effective_state") != "starting"
+
+
+def test_reconcile_skips_setup_disabled_agents(monkeypatch, tmp_path):
+    """Setup-disabled agents must be skipped from reconcile, like hidden/archived."""
+    _isolate_gateway_paths(monkeypatch, tmp_path)
+    client = _RecordingHeartbeatClient()
+    daemon = _build_daemon(client)
+    entry = {
+        "name": "disabled-agent",
+        "agent_id": "agent-disabled",
+        "template_id": "echo",
+        "runtime_type": "echo",
+        "desired_state": "running",
+        "lifecycle_phase": "active",
+        "setup_disabled": True,
+    }
+    registry = {"agents": [entry]}
+    daemon._reconcile_registry(registry, session={"token": "axp_u_test", "base_url": "http://x"})
+    assert "disabled-agent" not in daemon._runtimes
+    stored = next(a for a in registry["agents"] if a["name"] == "disabled-agent")
+    assert "attestation_state" not in stored or stored.get("attestation_state") in (None, "")
+
+
+def test_sweep_skips_setup_disabled_no_upstream(monkeypatch, tmp_path):
+    """Setup-disabled agents must not generate upstream heartbeat traffic."""
+    _isolate_gateway_paths(monkeypatch, tmp_path)
+    client = _RecordingHeartbeatClient()
+    daemon = _build_daemon(client)
+    entry = _stale_hermes_entry("hermes-disabled", age_seconds=20 * 60)
+    entry["setup_disabled"] = True
+    entry["liveness"] = "offline"
+    registry = {"agents": [entry]}
+    daemon._sweep_lifecycle(registry, session={"token": "axp_u_test", "base_url": "http://x"})
+    assert client.heartbeats == []
+
+
+def test_proactive_binary_check_catches_missing_python(monkeypatch, tmp_path):
+    """When the hermes python binary path is absolute and missing, the error
+    should say 'Python binary not found' and increment consecutive_setup_errors."""
+    _isolate_gateway_paths(monkeypatch, tmp_path)
+    missing_python = str(tmp_path / "venv" / "bin" / "python3")
+
+    long_ago = (datetime.now(timezone.utc) - timedelta(seconds=700)).isoformat()
+
+    runtime = gateway_core.ManagedAgentRuntime(
+        {
+            "name": "binary-check",
+            "agent_id": "agent-bin",
+            "space_id": "space-1",
+            "base_url": "https://paxai.app",
+            "runtime_type": "hermes_sentinel",
+            "token_file": str(tmp_path / "tok"),
+            "hermes_python": missing_python,
+            "last_runtime_error_at": long_ago,
+            "consecutive_setup_errors": 0,
+        },
+        client_factory=lambda **kwargs: object(),
+    )
+
+    token_file = Path(str(runtime.entry.get("token_file")))
+    token_file.parent.mkdir(parents=True, exist_ok=True)
+    token_file.write_text("axp_a_test_token")
+
+    sentinel_dir = Path(gateway_core.__file__).resolve().parent / "runtimes" / "hermes"
+    sentinel_script = sentinel_dir / "sentinel.py"
+    if not sentinel_script.exists():
+        sentinel_dir.mkdir(parents=True, exist_ok=True)
+        sentinel_script.write_text("# stub")
+
+    runtime.start()
+    state_error = runtime._state.get("last_error") or ""
+    assert "Python binary not found" in state_error
+    assert runtime.entry.get("consecutive_setup_errors") == 1
+
+
+def test_proactive_binary_check_skips_relative_path(monkeypatch, tmp_path):
+    """A relative python path like 'python3' should not be pre-checked
+    (PATH resolution differs between validation and Popen time)."""
+    _isolate_gateway_paths(monkeypatch, tmp_path)
+
+    long_ago = (datetime.now(timezone.utc) - timedelta(seconds=700)).isoformat()
+
+    workdir = tmp_path / "agents" / "relative-check"
+    runtime = gateway_core.ManagedAgentRuntime(
+        {
+            "name": "relative-check",
+            "agent_id": "agent-rel",
+            "space_id": "space-1",
+            "base_url": "https://paxai.app",
+            "runtime_type": "hermes_sentinel",
+            "token_file": str(tmp_path / "tok"),
+            "hermes_python": "python3",
+            "workdir": str(workdir),
+            "last_runtime_error_at": long_ago,
+            "consecutive_setup_errors": 0,
+        },
+        client_factory=lambda **kwargs: object(),
+    )
+
+    token_file = Path(str(runtime.entry.get("token_file")))
+    token_file.parent.mkdir(parents=True, exist_ok=True)
+    token_file.write_text("axp_a_test_token")
+
+    sentinel_dir = Path(gateway_core.__file__).resolve().parent / "runtimes" / "hermes"
+    sentinel_script = sentinel_dir / "sentinel.py"
+    if not sentinel_script.exists():
+        sentinel_dir.mkdir(parents=True, exist_ok=True)
+        sentinel_script.write_text("# stub")
+
+    runtime.start()
+    state_error = runtime._state.get("last_error") or ""
+    assert "Python binary not found" not in state_error
+
+
+def test_operator_start_clears_error_state(monkeypatch, tmp_path):
+    """ax gateway agents start must clear all setup-error/disable fields."""
+    _isolate_gateway_paths(monkeypatch, tmp_path)
+    monkeypatch.setenv("AX_CONFIG_DIR", str(tmp_path / "config"))
+
+    gateway_core.save_gateway_session(
+        {
+            "token": "axp_u_test",
+            "base_url": "https://paxai.app",
+            "space_id": "space-1",
+        }
+    )
+
+    registry = {
+        "agents": [
+            {
+                "name": "errored-agent",
+                "agent_id": "agent-err",
+                "template_id": "echo",
+                "runtime_type": "echo",
+                "desired_state": "stopped",
+                "setup_disabled": True,
+                "setup_disabled_at": gateway_core._now_iso(),
+                "setup_disabled_reason": "Auto-disabled after 10 errors",
+                "consecutive_setup_errors": 10,
+                "last_setup_error_signature": "some error",
+                "last_runtime_error_at": gateway_core._now_iso(),
+            }
+        ],
+    }
+    gateway_core.save_gateway_registry(registry)
+
+    gateway_cmd._set_managed_agent_desired_state("errored-agent", "running")
+    reloaded = gateway_core.load_gateway_registry()
+    entry = next(a for a in reloaded["agents"] if a["name"] == "errored-agent")
+    assert entry["desired_state"] == "running"
+    assert entry.get("setup_disabled") is False
+    assert entry.get("consecutive_setup_errors") == 0
+    assert entry.get("last_runtime_error_at") is None
+    assert entry.get("setup_disabled_at") is None
+
+
+def test_different_error_signature_resets_consecutive_count(monkeypatch, tmp_path):
+    """When the error message changes, consecutive count resets to 1."""
+    _isolate_gateway_paths(monkeypatch, tmp_path)
+
+    runtime = gateway_core.ManagedAgentRuntime(
+        {
+            "name": "sig-reset",
+            "agent_id": "agent-sig",
+            "space_id": "space-1",
+            "base_url": "https://paxai.app",
+            "runtime_type": "echo",
+            "consecutive_setup_errors": 5,
+            "last_setup_error_signature": "Token file not found: /old/path",
+        },
+        client_factory=lambda **kwargs: object(),
+    )
+
+    runtime._record_setup_error("Python binary not found: /new/path")
+    assert runtime.entry["consecutive_setup_errors"] == 1
+    assert runtime.entry["last_setup_error_signature"] == "Python binary not found: /new/path"[:120]
+
+
+def test_same_error_signature_increments_consecutive_count(monkeypatch, tmp_path):
+    """Same error signature increments the consecutive count."""
+    _isolate_gateway_paths(monkeypatch, tmp_path)
+
+    error_msg = "Token file not found: /some/path"
+    runtime = gateway_core.ManagedAgentRuntime(
+        {
+            "name": "sig-inc",
+            "agent_id": "agent-inc",
+            "space_id": "space-1",
+            "base_url": "https://paxai.app",
+            "runtime_type": "echo",
+            "consecutive_setup_errors": 3,
+            "last_setup_error_signature": error_msg[:120],
+        },
+        client_factory=lambda **kwargs: object(),
+    )
+
+    runtime._record_setup_error(error_msg)
+    assert runtime.entry["consecutive_setup_errors"] == 4
 
 
 # -- Active-space simplification (single source of truth) ---------------------

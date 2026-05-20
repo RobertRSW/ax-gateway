@@ -55,7 +55,8 @@ SSE_IDLE_TIMEOUT_SECONDS = 45.0
 RUNTIME_HEARTBEAT_INTERVAL_SECONDS = 30.0
 RUNTIME_STALE_AFTER_SECONDS = 75.0
 RUNTIME_HIDDEN_AFTER_SECONDS = 15 * 60.0  # default: hide stale agents after 15 min
-SETUP_ERROR_BACKOFF_SECONDS = 30.0  # silence retry storm after a runtime setup error
+SETUP_ERROR_BACKOFF_SCHEDULE = (30.0, 60.0, 120.0, 300.0, 600.0)
+SETUP_ERROR_MAX_CONSECUTIVE = 10
 # active = visible, normal operation
 # hidden = system auto-hid because of staleness; auto-restores on reconnect
 # archived = user explicitly disabled; sticky (no auto-restore); requires explicit `agents restore`
@@ -4778,6 +4779,11 @@ class ManagedAgentRuntime:
             "last_reply_message_id": None,
             "last_reply_preview": None,
             "reconnect_backoff_seconds": 0,
+            "consecutive_setup_errors": int(entry.get("consecutive_setup_errors") or 0),
+            "last_setup_error_signature": entry.get("last_setup_error_signature"),
+            "setup_disabled": bool(entry.get("setup_disabled")),
+            "setup_disabled_at": entry.get("setup_disabled_at"),
+            "setup_disabled_reason": entry.get("setup_disabled_reason"),
         }
 
     @property
@@ -4952,7 +4958,67 @@ class ManagedAgentRuntime:
             self._state.update(merged)
             return dict(self._state)
 
+    def _record_setup_error(self, error: str) -> None:
+        signature = error[:120]
+        with self._state_lock:
+            prev_sig = self._state.get("last_setup_error_signature")
+            prev_count = int(self._state.get("consecutive_setup_errors") or 0)
+        if prev_sig == signature:
+            count = prev_count + 1
+        else:
+            count = 1
+        self._update_state(
+            effective_state="error",
+            current_status="error",
+            current_activity=error,
+            last_error=error,
+            last_runtime_error_at=_now_iso(),
+            consecutive_setup_errors=count,
+            last_setup_error_signature=signature,
+        )
+        self.entry["consecutive_setup_errors"] = count
+        self.entry["last_setup_error_signature"] = signature
+        self.entry["last_runtime_error_at"] = self._state.get("last_runtime_error_at")
+        record_gateway_activity(
+            "runtime_error",
+            entry=self.entry,
+            error=error,
+            consecutive_setup_errors=count,
+        )
+        self._log(f"setup error ({count}/{SETUP_ERROR_MAX_CONSECUTIVE}): {error}")
+        if count >= SETUP_ERROR_MAX_CONSECUTIVE:
+            disabled_at = _now_iso()
+            reason = f"Auto-disabled after {count} consecutive setup errors: {error[:200]}"
+            self._update_state(
+                setup_disabled=True,
+                setup_disabled_at=disabled_at,
+                setup_disabled_reason=reason,
+            )
+            self.entry["setup_disabled"] = True
+            self.entry["setup_disabled_at"] = disabled_at
+            self.entry["setup_disabled_reason"] = reason
+            record_gateway_activity(
+                "runtime_auto_disabled",
+                entry=self.entry,
+                consecutive_errors=count,
+                error=error[:200],
+            )
+            self._log(f"auto-disabled after {count} consecutive setup errors")
+
+    def _clear_setup_error_state(self) -> None:
+        fields = {
+            "consecutive_setup_errors": 0,
+            "last_setup_error_signature": None,
+            "setup_disabled": False,
+            "setup_disabled_at": None,
+            "setup_disabled_reason": None,
+        }
+        self._update_state(**fields)
+        self.entry.update(fields)
+
     def start(self) -> None:
+        if self.entry.get("setup_disabled"):
+            return
         runtime_type = str(self.entry.get("runtime_type") or "").lower()
         if (
             _is_supervised_subprocess_runtime(runtime_type)
@@ -4962,17 +5028,17 @@ class ManagedAgentRuntime:
             return
         if self._listener_thread and self._listener_thread.is_alive():
             return
-        # Setup-error backoff: if this runtime hit a setup error within the
-        # backoff window (missing token file, missing script, etc.), do not
-        # retry every reconcile tick. Retrying every 1s does not help — the
-        # operator must fix the precondition first — and each attempt fires
-        # a runtime_error activity event and can pressure upstream rate
-        # limits. Operator-driven `agents start <name>` clears the field
-        # via the explicit desired_state transition.
+        # Escalating backoff: index into the schedule using consecutive error
+        # count.  First failure waits 30s, then 60/120/300/600s.  Prevents
+        # retry-storms when the precondition (binary, token, script) stays
+        # broken — the operator must fix it and `agents start <name>`.
         last_runtime_error_at = self.entry.get("last_runtime_error_at")
         if last_runtime_error_at:
+            consecutive = int(self.entry.get("consecutive_setup_errors") or 0)
+            idx = min(max(consecutive - 1, 0), len(SETUP_ERROR_BACKOFF_SCHEDULE) - 1)
+            backoff = SETUP_ERROR_BACKOFF_SCHEDULE[idx]
             age = _age_seconds(last_runtime_error_at)
-            if age is not None and age < SETUP_ERROR_BACKOFF_SECONDS:
+            if age is not None and age < backoff:
                 return
         self.stop_event.clear()
         self._queue = queue.Queue(maxsize=int(self.entry.get("queue_size") or DEFAULT_QUEUE_SIZE))
@@ -5071,30 +5137,19 @@ class ManagedAgentRuntime:
         workdir = _hermes_sentinel_workdir(self.entry)
         script = _hermes_sentinel_script(self.entry)
         if not script.exists():
-            error = f"Hermes sentinel script not found: {script}"
-            self._update_state(
-                effective_state="error",
-                current_status="error",
-                current_activity=error,
-                last_error=error,
-                last_runtime_error_at=_now_iso(),
-            )
-            self.entry["last_runtime_error_at"] = self._state.get("last_runtime_error_at")
-            record_gateway_activity("runtime_error", entry=self.entry, error=error)
+            self._record_setup_error(f"Hermes sentinel script not found: {script}")
             return
         try:
             load_gateway_managed_agent_token(self.entry)
         except ValueError as exc:
-            error = str(exc)
-            self._update_state(
-                effective_state="error",
-                current_status="error",
-                current_activity=error,
-                last_error=error,
-                last_runtime_error_at=_now_iso(),
+            self._record_setup_error(str(exc))
+            return
+        python_binary = _hermes_sentinel_python(self.entry)
+        python_path = Path(python_binary)
+        if python_path.is_absolute() and not python_path.exists():
+            self._record_setup_error(
+                f"Python binary not found: {python_binary} (listener may need reinstall or venv rebuild)"
             )
-            self.entry["last_runtime_error_at"] = self._state.get("last_runtime_error_at")
-            record_gateway_activity("runtime_error", entry=self.entry, error=error)
             return
 
         workdir.mkdir(parents=True, exist_ok=True)
@@ -5108,9 +5163,6 @@ class ManagedAgentRuntime:
                 f"\n[{_now_iso()}] Gateway starting Hermes sentinel: {' '.join(shlex.quote(part) for part in cmd)}\n"
             )
             log_handle.flush()
-            # Capture stdout via pipe so we can parse AX_GATEWAY_EVENT lines
-            # and forward them to the activity stream. Non-event lines tee
-            # back to the log file so operator visibility is preserved.
             process = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
@@ -5130,19 +5182,11 @@ class ManagedAgentRuntime:
             )
             self._sentinel_stdout_thread.start()
         except Exception as exc:
-            error = f"Failed to start Hermes sentinel: {str(exc)[:360]}"
-            self._update_state(
-                effective_state="error",
-                current_status="error",
-                current_activity=error,
-                last_error=error,
-                last_runtime_error_at=_now_iso(),
-            )
-            self.entry["last_runtime_error_at"] = self._state.get("last_runtime_error_at")
-            record_gateway_activity("runtime_error", entry=self.entry, error=error)
+            self._record_setup_error(f"Failed to start Hermes sentinel: {str(exc)[:360]}")
             return
 
         self._supervised_process = process
+        self._clear_setup_error_state()
         self._update_state(
             effective_state="running",
             current_status=None,
@@ -6672,6 +6716,14 @@ class GatewayDaemon:
                     self._runtimes.pop(name, None)
                 continue
 
+            if entry.get("setup_disabled"):
+                name = str(entry.get("name") or "")
+                runtime = self._runtimes.get(name)
+                if runtime is not None:
+                    runtime.stop()
+                    self._runtimes.pop(name, None)
+                continue
+
             asset_id = _asset_id_for_entry(entry)
             existing_binding = (
                 find_binding(registry, install_id=str(entry.get("install_id") or "").strip()) if asset_id else None
@@ -6826,6 +6878,9 @@ class GatewayDaemon:
             # heartbeating to paxai.app while the operator has taken the
             # agent out of the active set.
             if phase in {"archived", "hidden"}:
+                continue
+
+            if entry.get("setup_disabled"):
                 continue
 
             # Placeholder: the sweep loop is retained for future per-tick
