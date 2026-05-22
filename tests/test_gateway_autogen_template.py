@@ -43,15 +43,22 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 BRIDGE_PATH = REPO_ROOT / "examples" / "gateway_autogen" / "autogen_bridge.py"
 
 
-def _install_fake_autogen(monkeypatch, on_messages_reply="stub autogen reply"):
+def _install_fake_autogen(
+    monkeypatch,
+    on_messages_reply="stub autogen reply",
+    stream_chunks=None,
+):
     """Stub the autogen-agentchat / autogen-ext / autogen-core packages
     in sys.modules so the bridge's lazy imports resolve without
     requiring the real packages.
 
     Implements the minimal surface the bridge uses. AssistantAgent
-    constructor captures kwargs and exposes an async on_messages that
-    returns a Response with `chat_message.content` matching
-    `on_messages_reply`. OpenAIChatCompletionClient captures kwargs.
+    constructor captures kwargs and exposes both an async `on_messages`
+    (returns a Response for back-compat) and an async-generator
+    `on_messages_stream` (yields per-token ModelClientStreamingChunkEvent
+    items if `stream_chunks` is provided, then a final Response with
+    `chat_message.content` matching `on_messages_reply`).
+    OpenAIChatCompletionClient captures kwargs.
 
     Same lesson as the merged groq / mistral tests: stub the optional
     dep at sys.modules so CI runs without it.
@@ -76,6 +83,15 @@ def _install_fake_autogen(monkeypatch, on_messages_reply="stub autogen reply"):
         def __init__(self, content):
             self.chat_message = _ChatMessage(content)
 
+    class _StreamingChunkEvent:
+        """ModelClientStreamingChunkEvent stand-in. Carries partial token
+        text as `content`, no `chat_message` attribute (the bridge's
+        duck-typed dispatch keys off that to distinguish chunks from
+        the final Response)."""
+
+        def __init__(self, content):
+            self.content = content
+
     class _OpenAIChatCompletionClient:
         def __init__(self, **kwargs):
             self.kwargs = kwargs
@@ -94,10 +110,22 @@ def _install_fake_autogen(monkeypatch, on_messages_reply="stub autogen reply"):
         async def on_messages(self, messages, cancellation_token=None):
             captured["calls"].append(
                 {
+                    "method": "on_messages",
                     "messages": [(m.content, m.source) for m in messages],
                 }
             )
             return _Response(on_messages_reply)
+
+        async def on_messages_stream(self, messages, cancellation_token=None):
+            captured["calls"].append(
+                {
+                    "method": "on_messages_stream",
+                    "messages": [(m.content, m.source) for m in messages],
+                }
+            )
+            for chunk_content in stream_chunks or []:
+                yield _StreamingChunkEvent(chunk_content)
+            yield _Response(on_messages_reply)
 
     fake_ac = _types.ModuleType("autogen_agentchat")
     fake_agents = _types.ModuleType("autogen_agentchat.agents")
@@ -216,8 +244,9 @@ def test_autogen_bridge_emits_lifecycle_events(monkeypatch, capsys) -> None:
 def test_autogen_bridge_calls_groq_llm_when_configured(monkeypatch, capsys) -> None:
     """When GROQ_API_KEY is set AND autogen-ext is importable, the
     bridge should build an OpenAIChatCompletionClient pointed at Groq's
-    OpenAI-compatible endpoint, wire it into an AssistantAgent, and
-    call on_messages() with the prompt as a TextMessage.
+    OpenAI-compatible endpoint, wire it into an AssistantAgent with
+    `model_client_stream=True`, and drive a single turn via
+    `on_messages_stream()` with the prompt as a TextMessage.
     """
     captured = _install_fake_autogen(
         monkeypatch,
@@ -256,10 +285,17 @@ def test_autogen_bridge_calls_groq_llm_when_configured(monkeypatch, capsys) -> N
     )
     assert client_kwargs["api_key"] == "gsk_test", "bridge should pass GROQ_API_KEY through to the model client"
 
-    # Agent was wired with the model client and a system_message that names the agent.
+    # Agent was wired with the model client, model_client_stream=True for
+    # per-token streaming events, and a system_message that names the agent.
     agent_kwargs = captured["agents"][0].kwargs
     assert agent_kwargs.get("model_client") is captured["clients"][0], (
         "Agent should be wired to the constructed Groq-backed model client"
+    )
+    assert agent_kwargs.get("model_client_stream") is True, (
+        "Agent must be constructed with model_client_stream=True so the "
+        "underlying OpenAIChatCompletionClient emits per-token chunks during "
+        "on_messages_stream(). Without that flag the bridge's activity feed "
+        "stays silent during the call."
     )
     assert "autogen-test" in agent_kwargs.get("system_message", ""), (
         "Agent system_message should name the routed agent so the model knows who it is replying as"
@@ -270,8 +306,13 @@ def test_autogen_bridge_calls_groq_llm_when_configured(monkeypatch, capsys) -> N
         f"bridge should sanitize agent name for AutoGen (hyphens to underscores). got: {agent_kwargs.get('name')!r}"
     )
 
-    # The on_messages call carried the prompt verbatim as a user message.
+    # The bridge calls the streaming variant, not the non-streaming one,
+    # so the operator sees per-token activity events during the call.
     call = captured["calls"][0]
+    assert call["method"] == "on_messages_stream", (
+        f"bridge should call on_messages_stream() to surface token-level "
+        f"activity events, got method={call.get('method')!r}"
+    )
     assert call["messages"] == [("what is the speed of light in km/s", "user")]
 
     # Completion event reports used_llm=True (and back-compat stub=False).
@@ -295,6 +336,170 @@ def test_autogen_bridge_calls_groq_llm_when_configured(monkeypatch, capsys) -> N
     assert reply_lines, "bridge did not print a reply line on stdout"
     assert "299,792" in reply_lines[-1], (
         f"bridge reply should be the model's response, not a stub ack. last line: {reply_lines[-1]!r}"
+    )
+
+
+def test_autogen_bridge_streams_activity_events_during_llm_call(monkeypatch, capsys) -> None:
+    """The streaming path should emit a `processing` status when the
+    first token arrives and at least one throttled `activity` event
+    with a rolling preview. This locks in the chatty-observability
+    contract that PR #38's review pass enforced on the langgraph
+    bridge. Without per-token signals the activity feed would go
+    silent for the duration of the LLM call.
+
+    Time is faked so the heartbeat fires deterministically without
+    sleeping.
+    """
+    captured = _install_fake_autogen(
+        monkeypatch,
+        on_messages_reply="Final answer: 299,792 km/s.",
+        stream_chunks=[
+            "Light ",
+            "travels at ",
+            "about ",
+            "299,792 km/s.",
+        ],
+    )
+
+    sys.path.insert(0, str(BRIDGE_PATH.parent))
+    try:
+        import autogen_bridge as bridge
+    finally:
+        sys.path.pop(0)
+
+    # Drive time.monotonic deterministically so each yielded chunk
+    # advances the clock past the ACTIVITY_HEARTBEAT_SECONDS threshold.
+    # Each call to monotonic() returns the next value in the list.
+    fake_now = iter([0.0, 0.0, 2.0, 4.0, 6.0, 8.0, 10.0, 12.0, 14.0])
+
+    def _next_monotonic() -> float:
+        try:
+            return next(fake_now)
+        except StopIteration:
+            return 99.0
+
+    monkeypatch.setattr(bridge.time, "monotonic", _next_monotonic)
+
+    monkeypatch.setenv("GROQ_API_KEY", "gsk_test")
+    monkeypatch.setenv("AX_BRIDGE_LLM_MODEL", "test-model-x")
+    monkeypatch.setattr(sys, "argv", ["autogen_bridge.py", "tell me about light"])
+    monkeypatch.setattr(sys, "stdin", io.StringIO(""))
+    monkeypatch.setenv("AX_GATEWAY_AGENT_NAME", "autogen-test")
+
+    rc = bridge.main()
+    out = capsys.readouterr()
+    assert rc == 0, f"bridge main() returned {rc}; expected 0"
+
+    event_lines = [line for line in out.out.splitlines() if line.startswith(bridge.EVENT_PREFIX)]
+    processing_messages: list[str] = []
+    streaming_activities: list[str] = []
+    for line in event_lines:
+        payload = json.loads(line[len(bridge.EVENT_PREFIX) :])
+        if payload.get("kind") == "status" and payload.get("status") == "processing":
+            processing_messages.append(str(payload.get("message") or ""))
+        if payload.get("kind") == "activity":
+            activity = str(payload.get("activity") or "")
+            if "test-model-x" in activity or "Streaming response" in activity:
+                streaming_activities.append(activity)
+
+    assert any("Groq is responding" in m for m in processing_messages), (
+        "bridge should emit a `Groq is responding` processing status on the first streamed token. "
+        f"got processing messages: {processing_messages!r}"
+    )
+    assert streaming_activities, (
+        "bridge should emit at least one throttled activity event with rolling preview "
+        f"during on_messages_stream(). all events: {event_lines!r}"
+    )
+
+    # The final Response content lands on stdout, not a chunk concatenation.
+    reply_lines = [line for line in out.out.splitlines() if line and not line.startswith(bridge.EVENT_PREFIX)]
+    assert reply_lines, "bridge did not print a reply line"
+    assert "299,792" in reply_lines[-1], (
+        f"bridge reply should be the final Response content, not the concatenated chunks. "
+        f"last line: {reply_lines[-1]!r}"
+    )
+
+    # Sanity check that the streaming method (not on_messages) was the one called.
+    assert len(captured["calls"]) == 1
+    assert captured["calls"][0]["method"] == "on_messages_stream"
+
+
+def test_autogen_bridge_falls_back_to_chunks_when_no_final_response(monkeypatch, capsys) -> None:
+    """If the stream completes without yielding a final Response
+    (some AutoGen builds may close the stream via an internal
+    terminator instead), the bridge should fall back to the
+    concatenated chunk text so a reply still lands on stdout.
+
+    Stubs the agent to yield only chunk events, no Response.
+    """
+    import types as _types
+
+    sys.path.insert(0, str(BRIDGE_PATH.parent))
+    try:
+        import autogen_bridge as bridge
+    finally:
+        sys.path.pop(0)
+
+    class _StreamingChunkEvent:
+        def __init__(self, content):
+            self.content = content
+
+    class _AssistantAgent:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.name = kwargs.get("name", "")
+
+        async def on_messages_stream(self, messages, cancellation_token=None):
+            for chunk_content in ["Partial ", "reply ", "only."]:
+                yield _StreamingChunkEvent(chunk_content)
+
+    class _OpenAIChatCompletionClient:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        async def close(self):
+            return None
+
+    class _TextMessage:
+        def __init__(self, content, source):
+            self.content = content
+            self.source = source
+
+    class _CancellationToken:
+        pass
+
+    fake_ac = _types.ModuleType("autogen_agentchat")
+    fake_agents = _types.ModuleType("autogen_agentchat.agents")
+    fake_agents.AssistantAgent = _AssistantAgent
+    fake_messages = _types.ModuleType("autogen_agentchat.messages")
+    fake_messages.TextMessage = _TextMessage
+    fake_core = _types.ModuleType("autogen_core")
+    fake_core.CancellationToken = _CancellationToken
+    fake_ext = _types.ModuleType("autogen_ext")
+    fake_ext_models = _types.ModuleType("autogen_ext.models")
+    fake_ext_models_openai = _types.ModuleType("autogen_ext.models.openai")
+    fake_ext_models_openai.OpenAIChatCompletionClient = _OpenAIChatCompletionClient
+    monkeypatch.setitem(sys.modules, "autogen_agentchat", fake_ac)
+    monkeypatch.setitem(sys.modules, "autogen_agentchat.agents", fake_agents)
+    monkeypatch.setitem(sys.modules, "autogen_agentchat.messages", fake_messages)
+    monkeypatch.setitem(sys.modules, "autogen_core", fake_core)
+    monkeypatch.setitem(sys.modules, "autogen_ext", fake_ext)
+    monkeypatch.setitem(sys.modules, "autogen_ext.models", fake_ext_models)
+    monkeypatch.setitem(sys.modules, "autogen_ext.models.openai", fake_ext_models_openai)
+
+    monkeypatch.setenv("GROQ_API_KEY", "gsk_test")
+    monkeypatch.setattr(sys, "argv", ["autogen_bridge.py", "hello"])
+    monkeypatch.setattr(sys, "stdin", io.StringIO(""))
+    monkeypatch.setenv("AX_GATEWAY_AGENT_NAME", "autogen-test")
+
+    rc = bridge.main()
+    out = capsys.readouterr()
+    assert rc == 0
+
+    reply_lines = [line for line in out.out.splitlines() if line and not line.startswith(bridge.EVENT_PREFIX)]
+    assert reply_lines, "bridge should fall back to chunk concatenation when no final Response"
+    assert "Partial reply only." in reply_lines[-1], (
+        f"bridge reply should be the chunk concatenation, got: {reply_lines[-1]!r}"
     )
 
 

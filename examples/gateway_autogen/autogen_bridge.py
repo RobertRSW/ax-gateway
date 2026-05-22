@@ -15,11 +15,13 @@ agent runs.
      AssistantAgent wired to a Groq-backed OpenAIChatCompletionClient
      pointed at https://api.groq.com/openai/v1 (Groq is
      OpenAI-compatible at that endpoint, so no Groq-specific AutoGen
-     extension is needed). The bridge then calls `agent.on_messages()`
-     to drive a single turn. Env overrides: AX_BRIDGE_LLM_MODEL
-     (default llama-3.3-70b-versatile), AX_BRIDGE_SYSTEM_PROMPT
-     (default "Reply concisely.", appended to the agent's system
-     message).
+     extension is needed). The bridge then drives a single turn via
+     `agent.on_messages_stream()` with `model_client_stream=True` so
+     token-level chunks surface as throttled ~1s activity events with
+     a rolling preview, keeping the operator's activity feed live
+     during the call. Env overrides: AX_BRIDGE_LLM_MODEL (default
+     llama-3.3-70b-versatile), AX_BRIDGE_SYSTEM_PROMPT (default
+     "Reply concisely.", appended to the agent's system message).
 
   2. Stub agent path. If `autogen-agentchat` is importable but Groq is
      not configured, the bridge emits an activity event explaining the
@@ -35,9 +37,8 @@ agent runs.
 The three-tier shape lets the bridge round-trip a reply through the
 Gateway end to end in CI / dev without LLM creds, and switch to real
 LLM execution in production environments where GROQ_API_KEY is
-provisioned. Multi-agent teams (RoundRobinGroupChat, SelectorGroupChat),
-tool calls, and token-level streaming activity events are deliberate
-follow-ups.
+provisioned. Multi-agent teams (RoundRobinGroupChat, SelectorGroupChat)
+and tool calls are deliberate follow-ups.
 
 Target AutoGen line: modern `autogen-agentchat` >=0.4 (async-first).
 Not the legacy `pyautogen` 0.2 line, which Microsoft is phasing out.
@@ -79,6 +80,8 @@ def _agent_name() -> str:
 DEFAULT_LLM_MODEL = "llama-3.3-70b-versatile"
 GROQ_OPENAI_BASE_URL = "https://api.groq.com/openai/v1"
 DEFAULT_SYSTEM_PROMPT_TAIL = "Reply concisely."
+ACTIVITY_HEARTBEAT_SECONDS = 1.0
+PREVIEW_MAX_CHARS = 180
 
 
 class RunResult(NamedTuple):
@@ -132,26 +135,81 @@ def _build_model_client(model: str):
     )
 
 
-async def _run_agent_once(agent, prompt: str) -> str:
-    """Send a single user message to the AutoGen agent and return the reply text.
+async def _run_agent_stream(agent, prompt: str, model: str) -> str:
+    """Send a single user message to the AutoGen agent and consume the
+    streaming events, surfacing throttled activity events to the
+    Gateway activity feed during the call.
 
-    Uses `on_messages` (non-streaming) for V1. Token-level streaming
-    activity events via `on_messages_stream` are a deliberate
-    follow-up, matching the cadence of how the langgraph bridge
-    initially shipped (PR #38) before adding streaming in review.
+    Uses `agent.on_messages_stream()` (async iterator) so operators
+    see the bridge thinking instead of staring at silence during the
+    multi-second LLM call. Matches the LangGraph bridge's pattern from
+    PR #38 review pass. The agent's `model_client_stream=True` flag is
+    what makes the underlying OpenAIChatCompletionClient emit
+    `ModelClientStreamingChunkEvent` items during the call. Without
+    that flag, the stream still works but only yields the final
+    Response at the end (no per-token signal).
+
+    Event types in the stream, identified by duck-typing.
+
+    - Final `Response` carries a `chat_message` attribute. We extract
+      the chat_message content as the canonical reply text.
+    - `ModelClientStreamingChunkEvent` carries a `content` string with
+      the partial token text. We accumulate these and emit throttled
+      `activity` events with a rolling preview (~1s heartbeat).
+
+    Other inner event types (tool-call events, etc.) are ignored at
+    this layer.
     """
     from autogen_agentchat.messages import TextMessage
     from autogen_core import CancellationToken
 
-    response = await agent.on_messages(
+    chunks: list[str] = []
+    final_reply = ""
+    first_chunk_seen = False
+    last_activity_at = 0.0
+
+    stream = agent.on_messages_stream(
         [TextMessage(content=prompt, source="user")],
         cancellation_token=CancellationToken(),
     )
-    chat_message = getattr(response, "chat_message", None)
-    if chat_message is None:
-        return ""
-    content = getattr(chat_message, "content", None)
-    return str(content or "")
+    async for event in stream:
+        chat_message = getattr(event, "chat_message", None)
+        if chat_message is not None:
+            inner_content = getattr(chat_message, "content", None)
+            final_reply = str(inner_content or "")
+            continue
+
+        content = getattr(event, "content", None)
+        if not isinstance(content, str) or not content:
+            continue
+
+        chunks.append(content)
+        now = time.monotonic()
+        if not first_chunk_seen:
+            first_chunk_seen = True
+            emit_event(
+                {
+                    "kind": "status",
+                    "status": "processing",
+                    "message": f"Groq is responding ({model})",
+                }
+            )
+        if now - last_activity_at >= ACTIVITY_HEARTBEAT_SECONDS:
+            preview = "".join(chunks).strip().replace("\n", " ")
+            if len(preview) > PREVIEW_MAX_CHARS:
+                preview = "..." + preview[-(PREVIEW_MAX_CHARS - 3) :]
+            emit_event(
+                {
+                    "kind": "activity",
+                    "activity": (f"{model}: {preview}" if preview else f"Streaming response from {model}..."),
+                }
+            )
+            last_activity_at = now
+
+    # Prefer the final Response content if it landed, else fall back to
+    # the accumulated chunks (some AutoGen builds may not emit a final
+    # Response if the stream completes via an internal terminator).
+    return final_reply or "".join(chunks).strip()
 
 
 def _run_autogen(prompt: str) -> RunResult:
@@ -212,10 +270,11 @@ def _run_autogen(prompt: str) -> RunResult:
         agent = AssistantAgent(
             name=safe_name,
             model_client=model_client,
+            model_client_stream=True,
             system_message=system_message,
         )
         try:
-            reply = asyncio.run(_run_agent_once(agent, prompt))
+            reply = asyncio.run(_run_agent_stream(agent, prompt, model))
         finally:
             # AutoGen model clients hold an underlying httpx client that
             # should be closed to avoid "unclosed connection" warnings
