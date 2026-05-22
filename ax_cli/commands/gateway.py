@@ -170,6 +170,40 @@ def _resolve_gateway_login_token(explicit_token: str | None) -> str:
     return auth_cmd._resolve_login_token(None)
 
 
+def _warn_if_gateway_session_stale() -> None:
+    """Warn when the gateway session PAT predates the user-login PAT.
+
+    `ax login` writes `~/.ax/user.toml`; `ax gateway login` writes
+    `~/.ax/gateway/session.json`. They're independent stores, so a PAT
+    rotation refreshed via `ax login` leaves the gateway session pointing
+    at a revoked token — failures show up only when a gateway command later
+    hits `/auth/exchange` and gets 401 (see #74, and #73 for the
+    raw-traceback UX of that failure).
+
+    File mtime is a coarse signal but a reliable one here: there's no
+    in-process reason for user.toml to be newer than session.json other
+    than the user re-logging-in / rotating the user PAT.
+
+    Fails closed silently — never raises, never blocks the command — so a
+    `stat()` error, missing user.toml (different env), or an unexpected
+    filesystem edge case can't break gateway commands themselves.
+    """
+    try:
+        from ..config import _user_config_path
+
+        session_p = gateway_core.session_path()
+        user_p = _user_config_path()
+        if not session_p.exists() or not user_p.exists():
+            return
+        if session_p.stat().st_mtime < user_p.stat().st_mtime:
+            err_console.print(
+                "[yellow]Warning:[/yellow] gateway session is older than your user login "
+                "— run `ax gateway login` to refresh."
+            )
+    except Exception:
+        return
+
+
 def _load_gateway_user_client() -> AxClient:
     session = load_gateway_session()
     if not session:
@@ -182,6 +216,7 @@ def _load_gateway_user_client() -> AxClient:
     if not token.startswith("axp_u_"):
         err_console.print("[red]Gateway bootstrap currently requires a user PAT (axp_u_).[/red]")
         raise typer.Exit(1)
+    _warn_if_gateway_session_stale()
     return AxClient(base_url=str(session.get("base_url") or auth_cmd.DEFAULT_LOGIN_BASE_URL), token=token)
 
 

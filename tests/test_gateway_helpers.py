@@ -3010,6 +3010,53 @@ class TestLoadGatewayUserClient:
         client.close()
 
 
+class TestGatewaySessionStalenessWarning:
+    """Regression for #74: warn when the gateway session predates the user
+    login PAT. Operator signal that a PAT rotation (or `ax login` against a
+    different env) has left the gateway session stale before the next
+    /auth/exchange 401 lands as a raw traceback (#73)."""
+
+    def _make_user_toml(self, monkeypatch, tmp_path, *, mtime: float) -> None:
+        monkeypatch.setenv("AX_CONFIG_DIR", str(tmp_path / "config"))
+        from ax_cli.config import _user_config_path
+
+        user_p = _user_config_path()
+        user_p.parent.mkdir(parents=True, exist_ok=True)
+        user_p.write_text('token = "axp_u_user.token"\nbase_url = "https://paxai.app"\n')
+        os.utime(user_p, (mtime, mtime))
+
+    def _make_session(self, *, mtime: float) -> None:
+        gw.save_gateway_session({"token": "axp_u_session.token", "base_url": "https://paxai.app"})
+        os.utime(gw.session_path(), (mtime, mtime))
+
+    def test_warns_when_session_older_than_user_toml(self, monkeypatch, tmp_path, capsys):
+        # session.json is older than user.toml — classic "rotated PAT, ran
+        # `ax login`, forgot `ax gateway login`" shape.
+        self._make_user_toml(monkeypatch, tmp_path, mtime=2_000_000.0)
+        self._make_session(mtime=1_000_000.0)
+        gw_cmd._load_gateway_user_client()
+        stderr = capsys.readouterr().err
+        assert "gateway session is older than your user login" in stderr
+        assert "ax gateway login" in stderr
+
+    def test_no_warning_when_session_newer_than_user_toml(self, monkeypatch, tmp_path, capsys):
+        # Fresh `ax gateway login` after `ax login` — no warning.
+        self._make_user_toml(monkeypatch, tmp_path, mtime=1_000_000.0)
+        self._make_session(mtime=2_000_000.0)
+        gw_cmd._load_gateway_user_client()
+        stderr = capsys.readouterr().err
+        assert "older than your user login" not in stderr
+
+    def test_no_warning_when_user_toml_missing(self, monkeypatch, tmp_path, capsys):
+        # Named env / never logged in to user.toml — silently skip, never
+        # crash the gateway command itself.
+        monkeypatch.setenv("AX_CONFIG_DIR", str(tmp_path / "config"))
+        self._make_session(mtime=1_000_000.0)
+        gw_cmd._load_gateway_user_client()
+        stderr = capsys.readouterr().err
+        assert "older than your user login" not in stderr
+
+
 class TestLocalOriginSignature:
     def test_excludes_agent_name(self):
         fp = {"exe_path": "/usr/bin/python3", "cwd": "/home/user", "user": "testuser"}
