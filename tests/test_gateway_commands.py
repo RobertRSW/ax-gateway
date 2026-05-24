@@ -8907,3 +8907,91 @@ def test_gateway_local_connect_404_uses_actionable_guidance(monkeypatch):
     assert "@wishy" in msg
     assert "Live Listener" in msg
     assert "ax gateway local connect wishy --workdir /repo" in msg
+# ── _hermes_sentinel_sdk_runtime ────────────────────────────────────────────
+#
+# The Hermes sentinel launcher historically hardcoded `--runtime hermes_sdk`,
+# which meant operators could never route a managed Hermes agent through
+# alternate SDK runtimes (openai_sdk, groq_sdk, gemini_sdk) that the
+# vendored sentinel itself supports. The helper below resolves the choice
+# from per-agent registry entry fields and falls back to the historical
+# default so existing setups are unchanged.
+
+
+def test_hermes_sentinel_sdk_runtime_defaults_to_hermes_sdk_when_unset():
+    """Without any of the override fields, behavior must match the historical
+    hardcoded value so no operator's existing managed-agent registration
+    changes meaning after this fix."""
+    entry = {"name": "ada"}
+    assert gateway_core._hermes_sentinel_sdk_runtime(entry) == "hermes_sdk"
+
+
+def test_hermes_sentinel_sdk_runtime_reads_sentinel_sdk_runtime_field():
+    """Primary operator knob: `sentinel_sdk_runtime`. Should win over any
+    fallbacks."""
+    entry = {"name": "ada", "sentinel_sdk_runtime": "gemini_sdk"}
+    assert gateway_core._hermes_sentinel_sdk_runtime(entry) == "gemini_sdk"
+
+
+def test_hermes_sentinel_sdk_runtime_reads_hermes_runtime_fallback():
+    """Secondary knob (some operators may already be using this name)."""
+    entry = {"name": "ada", "hermes_runtime": "groq_sdk"}
+    assert gateway_core._hermes_sentinel_sdk_runtime(entry) == "groq_sdk"
+
+
+def test_hermes_sentinel_sdk_runtime_reads_sdk_runtime_fallback():
+    """Tertiary knob — terse alias."""
+    entry = {"name": "ada", "sdk_runtime": "openai_sdk"}
+    assert gateway_core._hermes_sentinel_sdk_runtime(entry) == "openai_sdk"
+
+
+def test_hermes_sentinel_sdk_runtime_rejects_unknown_values():
+    """A typo or unknown runtime name must fall back to the default rather
+    than crash the launcher with a bad `--runtime` arg."""
+    entry = {"name": "ada", "sentinel_sdk_runtime": "made_up_runtime"}
+    assert gateway_core._hermes_sentinel_sdk_runtime(entry) == "hermes_sdk"
+
+
+def test_hermes_sentinel_sdk_runtime_is_case_insensitive():
+    """Operators may write `Gemini_SDK` or `GEMINI_SDK` in config; both
+    should resolve to the canonical lowercase id."""
+    entry = {"name": "ada", "sentinel_sdk_runtime": "GEMINI_SDK"}
+    assert gateway_core._hermes_sentinel_sdk_runtime(entry) == "gemini_sdk"
+
+
+def test_build_hermes_sentinel_cmd_threads_configured_runtime_into_argv():
+    """End-to-end: a registry entry with `sentinel_sdk_runtime` set must
+    cause the launcher to emit `--runtime gemini_sdk` instead of the
+    default `hermes_sdk`. Regression for the bug where the launcher
+    hardcoded the runtime name and made every provider runtime
+    unreachable via Gateway."""
+    entry = {
+        "name": "gemini-test",
+        "space_id": "space-x",
+        "active_space_name": "RobertRSW's Workspace",
+        "base_url": "https://paxai.app",
+        "workdir": "/tmp/gemini-test",
+        "runtime_type": "hermes_sentinel",
+        "sentinel_sdk_runtime": "gemini_sdk",
+    }
+    cmd = gateway_core._build_hermes_sentinel_cmd(entry)
+    assert "--runtime" in cmd
+    runtime_idx = cmd.index("--runtime") + 1
+    assert cmd[runtime_idx] == "gemini_sdk"
+
+
+def test_build_hermes_sentinel_cmd_default_runtime_unchanged_for_existing_entries():
+    """Regression gate: any pre-existing managed-agent entry (without the
+    new sentinel_sdk_runtime field) must still get --runtime hermes_sdk
+    so this change is strictly additive."""
+    entry = {
+        "name": "ada",
+        "space_id": "space-y",
+        "active_space_name": "WS",
+        "base_url": "https://paxai.app",
+        "workdir": "/tmp/ada",
+        "runtime_type": "hermes_sentinel",
+    }
+    cmd = gateway_core._build_hermes_sentinel_cmd(entry)
+    assert "--runtime" in cmd
+    runtime_idx = cmd.index("--runtime") + 1
+    assert cmd[runtime_idx] == "hermes_sdk"
