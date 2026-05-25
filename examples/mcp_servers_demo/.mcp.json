@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "report_gen": {
+      "type": "stdio",
+      "command": "python",
+      "args": ["-m", "ax_cli.runtimes.mcp_servers.report_gen"]
+    },
+    "svg_viz": {
+      "type": "stdio",
+      "command": "python",
+      "args": ["-m", "ax_cli.runtimes.mcp_servers.svg_viz"]
+    }
+  }
+}
