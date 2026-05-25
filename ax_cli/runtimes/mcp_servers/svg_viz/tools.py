@@ -18,6 +18,10 @@ import json
 from typing import Any
 
 from ..stdio_server import ToolSpec
+from .post_to_chat import (
+    POST_TO_CHAT_INPUT_SCHEMA,
+    _handle_post_to_chat,
+)
 from .renderers import render_chart, render_status_card
 
 CHART_INPUT_SCHEMA: dict[str, Any] = {
@@ -162,5 +166,19 @@ def build_tools() -> list[ToolSpec]:
             ),
             input_schema=STATUS_CARD_INPUT_SCHEMA,
             handler=_handle_status_card,
+        ),
+        ToolSpec(
+            name="post_to_chat",
+            description=(
+                "Post a previously-generated SVG to the aX chat as a folded "
+                "signal card (not as raw markup). Uploads the SVG to the "
+                "context API and posts a message with a ui.widget signal so "
+                "paxai renders it inline. Call this AFTER chart or status_card "
+                "to make the visualization appear as a clickable card. Returns "
+                "{ok, message_id, context_key, space_id, title, resource_uri} "
+                "on success, or {error, code} on failure. Required: svg, title."
+            ),
+            input_schema=POST_TO_CHAT_INPUT_SCHEMA,
+            handler=_handle_post_to_chat,
         ),
     ]

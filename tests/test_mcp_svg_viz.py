@@ -14,10 +14,11 @@ from ax_cli.runtimes.mcp_servers.svg_viz.tools import (
 )
 
 
-def test_build_tools_returns_chart_and_status_card():
+def test_build_tools_returns_render_and_post_tools():
     tools = build_tools()
     names = [t.name for t in tools]
-    assert names == ["chart", "status_card"]
+    # chart + status_card render; post_to_chat publishes to aX chat as a signal card.
+    assert names == ["chart", "status_card", "post_to_chat"]
     for tool in tools:
         assert tool.input_schema["type"] == "object"
         assert "required" in tool.input_schema
