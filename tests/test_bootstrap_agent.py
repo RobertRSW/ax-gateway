@@ -513,3 +513,138 @@ def test_create_agent_in_space_other_errors_still_raise(monkeypatch):
     with pytest.raises(httpx.HTTPStatusError) as exc:
         bootstrap_cmd._create_agent_in_space(client, name="x", space_id=SPACE_ID, description=None, model=None)
     assert exc.value.response.status_code == 500
+
+
+# ── _create_agent_in_space management API path (exchanger clients) ───────
+
+
+class _MgmtFakeClient(_FakeClient):
+    """_FakeClient with _exchanger enabled and a controllable mgmt_create_agent."""
+
+    def __init__(self, http, *, mgmt_side_effect=None):
+        super().__init__(http)
+        self._exchanger = True
+        self._mgmt_side_effect = mgmt_side_effect
+
+    def mgmt_create_agent(self, name, **kwargs):
+        if self._mgmt_side_effect is not None:
+            effect = self._mgmt_side_effect
+            if isinstance(effect, BaseException):
+                raise effect
+            if callable(effect):
+                return effect(name, **kwargs)
+        return {"id": AGENT_ID, "name": name, "space_id": SPACE_ID}
+
+
+def test_mgmt_create_agent_happy_path():
+    """Exchanger client uses mgmt_create_agent and returns the agent dict."""
+    http = _FakeHttp({})
+    client = _MgmtFakeClient(http)
+    result = bootstrap_cmd._create_agent_in_space(
+        client, name="test-agent", space_id=SPACE_ID, description=None, model=None
+    )
+    assert result["id"] == AGENT_ID
+    assert result["name"] == "test-agent"
+    assert len(http.calls) == 0
+
+
+def test_mgmt_create_agent_unwraps_envelope():
+    """Management API wrapping {"agent": {...}} is unwrapped transparently."""
+    wrapped = {"agent": {"id": AGENT_ID, "name": "wrapped-agent", "space_id": SPACE_ID}}
+    http = _FakeHttp({})
+    client = _MgmtFakeClient(http, mgmt_side_effect=lambda *a, **kw: wrapped)
+    result = bootstrap_cmd._create_agent_in_space(
+        client, name="wrapped-agent", space_id=SPACE_ID, description=None, model=None
+    )
+    assert result["id"] == AGENT_ID
+    assert result["name"] == "wrapped-agent"
+
+
+def test_mgmt_create_agent_409_falls_back_to_get():
+    """409 from mgmt_create_agent falls back to _find_agent_in_space."""
+    existing = {"id": AGENT_ID, "name": "existing-bot", "space_id": SPACE_ID}
+    exc_409 = httpx.HTTPStatusError(
+        "409 Conflict",
+        request=httpx.Request("POST", "http://test.local/api/v1/agents/manage/create"),
+        response=httpx.Response(409, json={"detail": "already exists"}),
+    )
+    http = _FakeHttp(
+        {
+            ("GET", "/api/v1/agents"): (200, {"agents": [existing]}, None),
+        }
+    )
+    client = _MgmtFakeClient(http, mgmt_side_effect=exc_409)
+    result = bootstrap_cmd._create_agent_in_space(
+        client, name="existing-bot", space_id=SPACE_ID, description=None, model=None
+    )
+    assert result["id"] == AGENT_ID
+
+
+def test_mgmt_create_agent_401_gives_actionable_error():
+    """401 from mgmt_create_agent produces an actionable re-login message."""
+    exc_401 = httpx.HTTPStatusError(
+        "401 Unauthorized",
+        request=httpx.Request("POST", "http://test.local/api/v1/agents/manage/create"),
+        response=httpx.Response(401, json={"detail": "unauthenticated"}),
+    )
+    http = _FakeHttp({})
+    client = _MgmtFakeClient(http, mgmt_side_effect=exc_401)
+    with pytest.raises(httpx.HTTPStatusError, match="ax gateway login"):
+        bootstrap_cmd._create_agent_in_space(client, name="x", space_id=SPACE_ID, description=None, model=None)
+
+
+def test_mgmt_create_agent_403_gives_actionable_error():
+    """403 from mgmt_create_agent produces an actionable scope message."""
+    exc_403 = httpx.HTTPStatusError(
+        "403 Forbidden",
+        request=httpx.Request("POST", "http://test.local/api/v1/agents/manage/create"),
+        response=httpx.Response(403, json={"detail": "forbidden"}),
+    )
+    http = _FakeHttp({})
+    client = _MgmtFakeClient(http, mgmt_side_effect=exc_403)
+    with pytest.raises(httpx.HTTPStatusError, match="agents.create scope"):
+        bootstrap_cmd._create_agent_in_space(client, name="x", space_id=SPACE_ID, description=None, model=None)
+
+
+def test_mgmt_create_agent_route_miss_falls_through_to_legacy():
+    """Non-JSON response from mgmt path falls through to legacy POST."""
+    exc_html = httpx.HTTPStatusError(
+        "404 Not Found",
+        request=httpx.Request("POST", "http://test.local/api/v1/agents/manage/create"),
+        response=httpx.Response(
+            404,
+            content=b"<html>Not Found</html>",
+            headers={"content-type": "text/html"},
+            request=httpx.Request("POST", "http://test.local/api/v1/agents/manage/create"),
+        ),
+    )
+    legacy_agent = {"id": AGENT_ID, "name": "legacy-agent", "space_id": SPACE_ID}
+    http = _FakeHttp(
+        {
+            ("POST", "/api/v1/agents"): (201, legacy_agent, None),
+        }
+    )
+    client = _MgmtFakeClient(http, mgmt_side_effect=exc_html)
+    result = bootstrap_cmd._create_agent_in_space(
+        client, name="legacy-agent", space_id=SPACE_ID, description=None, model=None
+    )
+    assert result["id"] == AGENT_ID
+    posts = [c for c in http.calls if c["method"] == "POST"]
+    assert len(posts) == 1
+
+
+def test_mgmt_create_agent_transport_error_falls_through_to_legacy():
+    """Network timeout/connection error falls through to legacy POST path."""
+    legacy_agent = {"id": AGENT_ID, "name": "fallback-agent", "space_id": SPACE_ID}
+    http = _FakeHttp(
+        {
+            ("POST", "/api/v1/agents"): (201, legacy_agent, None),
+        }
+    )
+    client = _MgmtFakeClient(http, mgmt_side_effect=ConnectionError("refused"))
+    result = bootstrap_cmd._create_agent_in_space(
+        client, name="fallback-agent", space_id=SPACE_ID, description=None, model=None
+    )
+    assert result["id"] == AGENT_ID
+    posts = [c for c in http.calls if c["method"] == "POST"]
+    assert len(posts) == 1

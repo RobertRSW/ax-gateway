@@ -103,12 +103,47 @@ def _effective_config_line() -> str:
     return f"[dim]base_url={base_url}  user_env={user_env}  source={source}[/dim]"
 
 
+def _html_response_diag(r: httpx.Response) -> str:
+    """Build a diagnostic string from an unexpected HTML response.
+
+    Extracts HTTP status, page title, key CDN/server headers, and a body
+    snippet so operators can identify whether the response is a CloudFront
+    fallback, an S3 SPA shell, or something else — without having to re-run
+    with a debugger.
+    """
+    import re as _re
+
+    html = r.text or ""
+    title_match = _re.search(r"<title[^>]*>([^<]+)</title>", html, _re.IGNORECASE)
+    title = title_match.group(1).strip() if title_match else None
+    diag_headers = {
+        k: r.headers[k]
+        for k in ("cf-ray", "x-request-id", "x-amzn-requestid", "x-cache", "server", "location")
+        if k in r.headers
+    }
+    body_snippet = html[:500].strip() if html else ""
+    diag = f"HTTP {r.status_code}"
+    if title:
+        diag += f', page title: "{title}"'
+    if diag_headers:
+        diag += f", headers: {diag_headers}"
+    if body_snippet:
+        diag += f", body: {body_snippet!r}"
+    return diag
+
+
 def _is_route_miss(exc: httpx.HTTPStatusError) -> bool:
     """Management routes sometimes get caught by the frontend proxy on prod,
-    returning HTML or 404/405. Detect so we can fall back."""
+    returning non-JSON responses or 404/405. Detect so we can fall back.
+
+    The real backend always returns JSON. Any non-JSON response (except for
+    a genuine 401 or 429, which should never be non-JSON) means CDN/proxy
+    intercepted the request before it reached the API. Explicit 404/405 are
+    also route misses regardless of content type.
+    """
     r = exc.response
-    ct = r.headers.get("content-type", "")
-    if "text/html" in ct or r.text.lstrip().startswith("<!"):
+    is_json = "application/json" in r.headers.get("content-type", "")
+    if not is_json and r.status_code not in {401, 429}:
         return True
     return r.status_code in {404, 405}
 
@@ -136,9 +171,10 @@ def _find_agent_in_space(client, name: str, space_id: str) -> Optional[dict]:
 
 
 def _create_agent_in_space(client, *, name: str, space_id: str, description: str | None, model: str | None) -> dict:
-    """POST /api/v1/agents with X-Space-Id. This is the creation path proven
-    to route through the ALB on prod (POST survives; PATCH/PUT to the same
-    prefix don't — see avatar-day PR).
+    """Create an agent in a space.
+
+    PAT/exchange clients use the management API (``/api/v1/agents/manage/create``).
+    Cognito clients fall back to the legacy ``POST /api/v1/agents`` path.
 
     On 409 ("agent already exists in this space"), fall back to GET-by-name —
     the caller's intent is "ensure this agent exists"; if backend already has
@@ -147,6 +183,44 @@ def _create_agent_in_space(client, *, name: str, space_id: str, description: str
     auto-created switchboard sender agent already exists on the backend but
     isn't in the local Gateway registry (drift after registry resets).
     """
+    if hasattr(client, "_exchanger") and client._exchanger:
+        try:
+            result = client.mgmt_create_agent(name, space_id=space_id, description=description, model=model)
+            # Management API may wrap the agent in {"agent": {...}} — unwrap so
+            # callers always get the agent dict and .get("id") resolves correctly.
+            return result.get("agent", result) if isinstance(result, dict) else result
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code
+            if status == 409:
+                existing = _find_agent_in_space(client, name, space_id)
+                if existing:
+                    return existing
+                raise
+            if status == 401:
+                raise httpx.HTTPStatusError(
+                    "Agent creation unauthenticated (401) — token is invalid or expired. "
+                    "Re-run `ax gateway login` to refresh your session.",
+                    request=exc.request,
+                    response=exc.response,
+                ) from exc
+            if status == 403:
+                raise httpx.HTTPStatusError(
+                    "Agent creation forbidden (403) — token is missing agents.create scope. "
+                    "Re-issue your token with the required scope or contact your space admin.",
+                    request=exc.request,
+                    response=exc.response,
+                ) from exc
+            if _is_route_miss(exc):
+                # Management routes not available on this backend — fall through
+                # to the legacy POST /api/v1/agents path below.
+                pass
+            else:
+                raise
+        except Exception:
+            # Network timeout, connection refused, DNS failure — fall through
+            # to the legacy POST path, same as _mint_agent_pat.
+            pass
+
     body: dict = {"name": name}
     if description is not None:
         body["description"] = description
@@ -164,6 +238,17 @@ def _create_agent_in_space(client, *, name: str, space_id: str, description: str
         # error so caller sees what the backend reported, not a misleading 404.
         r.raise_for_status()
     r.raise_for_status()
+    _ct = r.headers.get("content-type", "")
+    if "text/html" in _ct or r.text.lstrip().startswith("<!"):
+        host = r.url.host if r.url else "the server"
+        raise httpx.HTTPStatusError(
+            f"Agent creation API not available on {host} — "
+            f"POST /api/v1/agents returned an HTML page instead of a JSON agent record "
+            f"({_html_response_diag(r)}). "
+            f"The server is not routing this request to the backend.",
+            request=r.request,
+            response=r,
+        )
     return client._parse_json(r)
 
 
