@@ -3296,13 +3296,21 @@ def load_gateway_registry() -> dict[str, Any]:
 def save_gateway_registry(registry: dict[str, Any], *, merge_archive: bool = True) -> Path:
     """Persist the registry to disk.
 
-    Performs three race-safety merges before writing:
+    Performs four race-safety merges before writing:
 
-    1. **Row preservation** (always on): re-reads disk and appends any
-       agent rows that exist on disk but not in memory *and* were not in
-       the caller's load-time snapshot. Recovers writes from a second
-       writer (e.g. the UI server's POST /api/agents add) that landed
-       between this caller's load and save.
+    1. **Row addition preservation** (always on): re-reads disk and
+       appends any agent rows that exist on disk but not in memory *and*
+       were not in the caller's load-time snapshot. Recovers writes from
+       a second writer (e.g. the UI server's POST /api/agents add) that
+       landed between this caller's load and save.
+
+    1b. **Row deletion preservation** (always on, #42): drops in-memory
+       agent rows that *were* in the caller's load-time snapshot but are
+       no longer on disk. Without this, a daemon poll loop saving its
+       long-lived view would resurrect agents that the CLI explicitly
+       removed — `axctl gateway agents remove <name>` exits 0, deletes
+       the token file, but the daemon's next save brings the entry back
+       within one poll cycle.
 
     2. **Operator-authoritative field preservation** (always on): for
        each field in _OPERATOR_AUTHORITATIVE_FIELDS (desired_state,
@@ -3354,6 +3362,23 @@ def save_gateway_registry(registry: dict[str, Any], *, merge_archive: bool = Tru
             if name in loaded_names:
                 continue  # caller removed it (was in our snapshot, not in memory)
             registry.setdefault("agents", []).append(disk_entry)
+
+        # (1b) Preserve row deletions made by another writer (#42).
+        # If a row was in our load-time snapshot AND is still in memory
+        # but is no longer on disk, another writer removed it after we
+        # loaded — respect their delete. The snapshot gate is essential:
+        # rows the caller added since load (not in snapshot) must not be
+        # dropped, only ones we shared with the prior on-disk state.
+        disk_names = {str(a.get("name") or "") for a in disk_agents if isinstance(a, dict) and a.get("name")}
+        registry["agents"] = [
+            entry
+            for entry in registry.get("agents") or []
+            if not (
+                isinstance(entry, dict)
+                and str(entry.get("name") or "") in loaded_names
+                and str(entry.get("name") or "") not in disk_names
+            )
+        ]
 
         # (2) Operator-authoritative field preservation.
         # If a field's disk value differs from our load-time snapshot,

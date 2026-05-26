@@ -7118,6 +7118,105 @@ def test_save_registry_preserves_other_writer_added_row(monkeypatch, tmp_path):
     assert incumbent["effective_state"] == "running"
 
 
+def test_save_registry_preserves_other_writer_row_deletion(monkeypatch, tmp_path):
+    """Race regression (#42): daemon's load → modify → save must not
+    resurrect an agent row that another writer (the CLI) removed between
+    the daemon's load and the daemon's save.
+
+    Reproduces the agents-remove bug from the #42 report:
+    ``axctl gateway agents remove <name>`` exited 0 and deleted the token
+    file, but the daemon's stale in-memory copy wrote the entry back on
+    the next poll cycle — agent reappeared in `agents list`, doctor went
+    red, and the operator was told the remove "didn't take".
+
+    Symmetric to test_save_registry_preserves_other_writer_added_row.
+    """
+    _isolate_gateway_paths(monkeypatch, tmp_path)
+    initial = {
+        "agents": [
+            {
+                "name": "incumbent",
+                "agent_id": "agent-incumbent",
+                "template_id": "hermes",
+                "runtime_type": "hermes_sentinel",
+                "lifecycle_phase": "active",
+                "desired_state": "running",
+            },
+            {
+                "name": "to-remove",
+                "agent_id": "agent-to-remove",
+                "template_id": "hermes",
+                "runtime_type": "hermes_sentinel",
+                "lifecycle_phase": "active",
+                "desired_state": "running",
+            },
+        ]
+    }
+    gateway_core.save_gateway_registry(initial)
+
+    # Daemon's stale in-memory copy from the start of its tick — still
+    # sees both agents.
+    daemon_view = gateway_core.load_gateway_registry()
+    daemon_view["agents"][0]["effective_state"] = "running"  # daemon-side update
+
+    # CLI loads, removes "to-remove", saves between daemon's load and save.
+    cli_view = gateway_core.load_gateway_registry()
+    cli_view["agents"] = [a for a in cli_view["agents"] if a["name"] != "to-remove"]
+    gateway_core.save_gateway_registry(cli_view)
+
+    # Daemon now saves its stale copy that still has to-remove. Row
+    # deletion preservation should drop to-remove from the daemon's view
+    # rather than resurrect it on disk.
+    gateway_core.save_gateway_registry(daemon_view)
+
+    final = gateway_core.load_gateway_registry()
+    names = {a["name"] for a in final["agents"]}
+    assert names == {"incumbent"}, (
+        "to-remove was resurrected by daemon save — registry remove race regressed (#42)"
+    )
+    # Daemon's effective_state update on the incumbent should still apply.
+    incumbent = next(a for a in final["agents"] if a["name"] == "incumbent")
+    assert incumbent["effective_state"] == "running"
+
+
+def test_save_registry_keeps_caller_added_row_when_disk_lost_it(monkeypatch, tmp_path):
+    """A row the caller just added (not in their snapshot) must survive
+    the new deletion-preservation logic. Snapshot is the gate that
+    distinguishes 'we just added this' from 'we always knew about it'.
+    """
+    _isolate_gateway_paths(monkeypatch, tmp_path)
+    initial = {
+        "agents": [
+            {
+                "name": "incumbent",
+                "agent_id": "agent-incumbent",
+                "template_id": "hermes",
+                "runtime_type": "hermes_sentinel",
+                "lifecycle_phase": "active",
+                "desired_state": "running",
+            }
+        ]
+    }
+    gateway_core.save_gateway_registry(initial)
+
+    cli_view = gateway_core.load_gateway_registry()
+    cli_view["agents"].append(
+        {
+            "name": "freshly-added",
+            "agent_id": "agent-freshly-added",
+            "template_id": "claude_code_channel",
+            "runtime_type": "claude_code_channel",
+            "lifecycle_phase": "active",
+            "desired_state": "running",
+        }
+    )
+    gateway_core.save_gateway_registry(cli_view)
+
+    final = gateway_core.load_gateway_registry()
+    names = {a["name"] for a in final["agents"]}
+    assert names == {"incumbent", "freshly-added"}
+
+
 def test_save_registry_preserves_other_writer_field_update(monkeypatch, tmp_path):
     """Race regression (field-level): the daemon's stale `desired_state=running`
     in-memory view must not clobber the CLI's freshly written
