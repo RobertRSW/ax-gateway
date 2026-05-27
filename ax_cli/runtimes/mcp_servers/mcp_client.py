@@ -153,9 +153,7 @@ class McpStdioClient:
         result = self._request("tools/call", {"name": name, "arguments": arguments})
         content = result.get("content") or []
         text_parts = [
-            str(block.get("text") or "")
-            for block in content
-            if isinstance(block, dict) and block.get("type") == "text"
+            str(block.get("text") or "") for block in content if isinstance(block, dict) and block.get("type") == "text"
         ]
         joined = "\n".join(text_parts)
         if result.get("isError"):
@@ -177,9 +175,7 @@ class McpStdioClient:
             response = self._read_until(request_id)
         if "error" in response:
             err = response["error"]
-            raise McpClientError(
-                f"{method} returned error: {err.get('message')} (code={err.get('code')})"
-            )
+            raise McpClientError(f"{method} returned error: {err.get('message')} (code={err.get('code')})")
         return response.get("result") or {}
 
     def _send(self, payload: dict[str, Any]) -> None:
@@ -201,15 +197,12 @@ class McpStdioClient:
         deadline = time.monotonic() + self._timeout_s
         while True:
             if time.monotonic() > deadline:
-                raise McpClientError(
-                    f"timed out waiting for response to id={expected_id}"
-                )
+                raise McpClientError(f"timed out waiting for response to id={expected_id}")
             raw = proc.stdout.readline()
             if not raw:
                 stderr_text = self._drain_stderr()
                 raise McpClientError(
-                    "server subprocess closed stdout"
-                    + (f" (stderr: {stderr_text})" if stderr_text else "")
+                    "server subprocess closed stdout" + (f" (stderr: {stderr_text})" if stderr_text else "")
                 )
             try:
                 payload = json.loads(raw.decode("utf-8").strip())
@@ -235,8 +228,7 @@ class McpStdioClient:
     def _capture_stderr_into_error(self, exc: Exception) -> None:
         stderr_text = self._drain_stderr()
         raise McpClientError(
-            f"write to server failed: {exc}"
-            + (f" (stderr: {stderr_text})" if stderr_text else "")
+            f"write to server failed: {exc}" + (f" (stderr: {stderr_text})" if stderr_text else "")
         ) from exc
 
     def _log(self, message: str) -> None:

@@ -112,10 +112,7 @@ def load_mcps_from_env(
         for spec in specs:
             tool_name = f"{label}__{spec.name}" if prefix_names else spec.name
             tools.append(_make_langchain_tool(client, spec, tool_name=tool_name))
-        _stderr(
-            f"[mcp-adapter] {label}: registered {len(specs)} tool(s) "
-            f"({', '.join(s.name for s in specs)})"
-        )
+        _stderr(f"[mcp-adapter] {label}: registered {len(specs)} tool(s) ({', '.join(s.name for s in specs)})")
 
     return tools, clients
 
@@ -129,9 +126,7 @@ def _load_config(raw: str) -> Any:
     return json.loads(raw)
 
 
-def _make_langchain_tool(
-    client: McpStdioClient, spec: McpToolSpec, *, tool_name: str
-) -> Any:
+def _make_langchain_tool(client: McpStdioClient, spec: McpToolSpec, *, tool_name: str) -> Any:
     """Construct a LangChain StructuredTool that routes calls to `client`."""
     from langchain_core.tools import StructuredTool
 
