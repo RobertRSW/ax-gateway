@@ -172,9 +172,10 @@ def test_reader_role_cannot_write_even_if_ast_bypassed():
 
 def test_query_timeout_aborts_long_running_select():
     """Use pg_sleep to force a wait longer than the 5s default."""
-    from ax_cli.runtimes.mcp_servers.report_gen.tools import run_query
-    # Override timeout to 1s for the test so it doesn't actually take 5s.
     import ax_cli.runtimes.mcp_servers.report_gen.tools as tools_mod
+    from ax_cli.runtimes.mcp_servers.report_gen.tools import run_query
+
+    # Override timeout to 1s for the test so it doesn't actually take 5s.
     prior_timeout = tools_mod.QUERY_TIMEOUT_S
     tools_mod.QUERY_TIMEOUT_S = 1.0
     try:

@@ -192,7 +192,7 @@ class PostgresBackend:
                         "truncated": truncated,
                         "row_limit": row_limit,
                     }
-        except psycopg.errors.QueryCanceled as e:
+        except psycopg.errors.QueryCanceled:
             return {"error": f"query exceeded {timeout_s}s timeout", "code": "TIMEOUT"}
         except psycopg.errors.InsufficientPrivilege as e:
             # Layer 2b kicked in — reader role refused a write. Surface as

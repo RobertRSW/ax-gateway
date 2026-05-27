@@ -9,11 +9,10 @@ import pytest
 # sqlglot is gated behind the [mcp] optional-extra; tests need it.
 sqlglot = pytest.importorskip("sqlglot")
 
-from ax_cli.runtimes.mcp_servers.report_gen.synthetic_db import (
-    ensure_database,
+from ax_cli.runtimes.mcp_servers.report_gen.synthetic_db import (  # noqa: E402
     seed_database,
 )
-from ax_cli.runtimes.mcp_servers.report_gen.tools import (
+from ax_cli.runtimes.mcp_servers.report_gen.tools import (  # noqa: E402
     ReadOnlyViolation,
     _check_sql_readonly,
     _handle_db_query,
@@ -183,8 +182,10 @@ def test_run_query_rejects_cte_smuggled_delete_via_error_code():
 
 def test_connection_level_readonly_blocks_writes_even_if_ast_bypassed():
     """If somehow the AST check missed a write, SQLite still refuses."""
-    from ax_cli.runtimes.mcp_servers.report_gen.synthetic_db import open_readonly, default_db_path
     import sqlite3
+
+    from ax_cli.runtimes.mcp_servers.report_gen.synthetic_db import default_db_path, open_readonly
+
     conn = open_readonly(default_db_path())
     try:
         with pytest.raises(sqlite3.OperationalError, match="readonly|read-only"):
