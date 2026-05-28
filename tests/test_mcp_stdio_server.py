@@ -166,3 +166,72 @@ def test_bad_json_lines_are_skipped(capsys):
     responses = [json.loads(line) for line in captured.out.strip().splitlines() if line.strip()]
     assert len(responses) == 1
     assert responses[0]["id"] == 1
+
+
+# ── Malformed-params robustness (eugeneluzgin PR #100 review) ───────────────
+
+
+def test_tool_call_with_string_params_returns_error_not_crash(capsys):
+    """A non-object `params` must not crash the server (params.get would raise)."""
+    config = _make_config(tools=[
+        ToolSpec(name="echo", description="", input_schema={"type": "object"},
+                 handler=lambda a: {"content": [{"type": "text", "text": "ok"}]}),
+    ])
+    responses = _drive(
+        config,
+        [{"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": "not-an-object"}],
+        capsys,
+    )
+    # Normalized to {} upstream, so it falls through to "Unknown tool: None"
+    assert "error" in responses[0]
+    assert responses[0]["error"]["code"] in (-32601, -32602)
+
+
+def test_tool_call_with_list_params_returns_error_not_crash(capsys):
+    config = _make_config(tools=[
+        ToolSpec(name="echo", description="", input_schema={"type": "object"},
+                 handler=lambda a: {"content": [{"type": "text", "text": "ok"}]}),
+    ])
+    responses = _drive(
+        config,
+        [{"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": [1, 2, 3]}],
+        capsys,
+    )
+    assert "error" in responses[0]
+
+
+def test_tool_call_with_non_dict_arguments_returns_error(capsys):
+    """`arguments` must be an object; a string/list there should error cleanly."""
+    config = _make_config(tools=[
+        ToolSpec(name="echo", description="", input_schema={"type": "object"},
+                 handler=lambda a: {"content": [{"type": "text", "text": "ok"}]}),
+    ])
+    responses = _drive(
+        config,
+        [{"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+          "params": {"name": "echo", "arguments": "not-an-object"}}],
+        capsys,
+    )
+    assert responses[0]["error"]["code"] == -32602
+    assert "arguments" in responses[0]["error"]["message"]
+
+
+def test_malformed_request_does_not_kill_the_loop(capsys):
+    """A request that triggers an unexpected error must not stop later requests."""
+    config = _make_config(tools=[
+        ToolSpec(name="echo", description="", input_schema={"type": "object"},
+                 handler=lambda a: {"content": [{"type": "text", "text": "ok"}]}),
+    ])
+    responses = _drive(
+        config,
+        [
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": "garbage"},
+            {"jsonrpc": "2.0", "id": 2, "method": "ping"},  # must still be served
+        ],
+        capsys,
+    )
+    # Two responses: the error for #1 AND the successful ping for #2
+    by_id = {r.get("id"): r for r in responses}
+    assert 1 in by_id
+    assert 2 in by_id
+    assert by_id[2]["result"] == {}

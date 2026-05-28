@@ -73,8 +73,17 @@ def _tool_text_response(text: str, is_error: bool = False) -> dict[str, Any]:
 
 
 def _handle_tool_call(config: ServerConfig, request_id: Any, params: dict[str, Any]) -> None:
+    # `params` and `params["arguments"]` must be objects. A malformed client
+    # could send a string/list/null; guard before calling .get() so a bad
+    # request returns a JSON-RPC error instead of crashing the server loop.
+    if not isinstance(params, dict):
+        _send_error(request_id, -32602, "Invalid params: expected an object")
+        return
     name = params.get("name")
     arguments = params.get("arguments") or {}
+    if not isinstance(arguments, dict):
+        _send_error(request_id, -32602, "Invalid params: 'arguments' must be an object")
+        return
     spec = next((t for t in config.tools if t.name == name), None)
     if spec is None:
         _send_error(request_id, -32601, f"Unknown tool: {name}")
@@ -91,7 +100,11 @@ def _handle_tool_call(config: ServerConfig, request_id: Any, params: dict[str, A
 def _handle_request(config: ServerConfig, request: dict[str, Any]) -> None:
     request_id = request.get("id")
     method = request.get("method")
-    params = request.get("params") or {}
+    params = request.get("params")
+    # Normalize params to a dict — JSON-RPC allows omitting it, but a malformed
+    # client could send a non-object. Downstream handlers assume a dict.
+    if not isinstance(params, dict):
+        params = {}
 
     if method == "initialize":
         _send_response(
@@ -146,5 +159,12 @@ def serve(config: ServerConfig) -> None:
         if "id" not in payload:
             _log(config, f"notification: {method}")
             continue
-        _handle_request(config, payload)
+        # A single malformed request must never crash the whole server loop.
+        # Per-request handlers already convert known-bad input into JSON-RPC
+        # errors; this is the backstop for anything they miss.
+        try:
+            _handle_request(config, payload)
+        except Exception as exc:  # noqa: BLE001 - daemon resilience
+            _log(config, f"request handling failed: {exc}\n{traceback.format_exc()}")
+            _send_error(payload.get("id"), -32603, f"Internal error: {exc}")
     _log(config, "stdin closed; shutting down")
